@@ -25,187 +25,131 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-def draw_chart(sym, exchange):
+def get_data_and_emas(sym, exchange):
     try:
-        df_15m, df_1w = None, None
+        df_1d, df_1w = None, None
         
-        # 1. 15-минутные свечи
+        # Берем дневной график для отрисовки
         if exchange == 'MEXC':
-            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=10).json()
+            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Day1", headers=HEADERS, timeout=10).json()
             if res.get('success'):
                 data = res['data']
-                df_15m = pd.DataFrame({
+                df_1d = pd.DataFrame({
                     'time': pd.to_datetime(data['time'], unit='s'),
                     'open': data['open'], 'high': data['high'], 
                     'low': data['low'], 'close': data['close'], 'volume': data['vol']
                 })
+            # Недельный график для EMA (или Месячный, если есть данные)
+            res_w = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Week1", headers=HEADERS, timeout=10).json()
+            if res_w.get('success'): df_1w = pd.DataFrame({'close': res_w['data']['close']})
+            
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=100", headers=HEADERS, timeout=10).json()
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=1D&limit=100", headers=HEADERS, timeout=10).json()
             if res.get('code') == '00000':
                 data = res['data']
-                df_15m = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-                df_15m = df_15m.iloc[::-1]
-                df_15m['time'] = pd.to_datetime(df_15m['time'].astype(float), unit='ms')
-                for col in ['open', 'high', 'low', 'close', 'volume']: df_15m[col] = df_15m[col].astype(float)
-
-        # 2. Недельные свечи (для EMA)
-        if exchange == 'MEXC':
-            res_1w = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Week1", headers=HEADERS, timeout=10).json()
-            if res_1w.get('success'): df_1w = pd.DataFrame({'close': res_1w['data']['close']})
-        elif exchange == 'Bitget':
-            res_1w = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=1week&limit=200", headers=HEADERS, timeout=10).json()
-            if res_1w.get('code') == '00000':
-                df_1w = pd.DataFrame(res_1w['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df_1d = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df_1d = df_1d.iloc[::-1]
+                df_1d['time'] = pd.to_datetime(df_1d['time'].astype(float), unit='ms')
+                for col in ['open', 'high', 'low', 'close', 'volume']: df_1d[col] = df_1d[col].astype(float)
+            
+            res_w = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=1week&limit=200", headers=HEADERS, timeout=10).json()
+            if res_w.get('code') == '00000':
+                df_1w = pd.DataFrame(res_w['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
                 df_1w['close'] = df_1w['close'].astype(float)
 
-        if df_15m is None or df_15m.empty or df_1w is None or df_1w.empty: return None, None, None
+        if df_1d is None or df_1d.empty or df_1w is None or df_1w.empty: return None, None
 
-        df_15m.set_index('time', inplace=True)
+        df_1d.set_index('time', inplace=True)
         
-        # Считаем недельные EMA
+        # Считаем Недельные EMA
         emas = {}
-        for span in [7, 14, 28, 50, 100]:
-            if len(df_1w) >= span: emas[span] = df_1w['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+        for span in [7, 14, 28, 50, 100, 200]:
+            if len(df_1w) >= span: 
+                emas[span] = df_1w['close'].ewm(span=span, adjust=False).mean().iloc[-1]
 
-        # Считаем Фибоначчи (по последним 50 свечам)
-        recent_df = df_15m.tail(50)
-        high_price = recent_df['high'].max()
-        low_price = recent_df['low'].min()
-        diff = high_price - low_price
-        
-        fib_levels = {}
-        if diff > 0:
-            fib_levels = {
-                '0.786': high_price - diff * 0.786,
-                '0.618': high_price - diff * 0.618,
-                '0.5': high_price - diff * 0.5,
-                '0.382': high_price - diff * 0.382
-            }
+        return df_1d, emas
+    except Exception as e:
+        print(f"Data error {sym}: {e}")
+        return None, None
 
+def draw_chart(sym, df_1d, emas, target_ema):
+    try:
         filename = f"{sym}_chart.png"
         
-        # Готовим линии
-        lines, colors, widths, styles = [], [], [], []
+        # Оставляем последние 60 дней для графика
+        plot_df = df_1d.tail(60)
         
-        # EMA (жирные линии)
-        for span, val in emas.items():
-            lines.append(val)
-            if span == 7: colors.append('blue')
-            elif span == 14: colors.append('orange')
-            elif span == 28: colors.append('purple')
-            elif span == 50: colors.append('green')
-            elif span == 100: colors.append('red')
-            widths.append(1.5)
-            styles.append('-')
-
-        # Фибоначчи (тонкие пунктиры)
-        for level, val in fib_levels.items():
-            lines.append(val)
-            colors.append('gray')
-            widths.append(0.8)
-            styles.append(':')
-
-        hlines = dict(hlines=lines, colors=colors, linestyle=styles, linewidths=widths) if lines else None
-                      
-        mpf.plot(df_15m.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, 
-                 title=f"{sym} 15m | Fib + 1W EMAs", tight_layout=True, hlines=hlines)
+        hlines = dict(hlines=[target_ema], colors=['green'], linestyle='-', linewidths=2.0)
         
-        return filename, emas, fib_levels
+        mpf.plot(plot_df, type='candle', style='yahoo', volume=True, savefig=filename, 
+                 title=f"{sym} 1D | Target EMA: {target_ema:.4f}", tight_layout=True, hlines=hlines)
+        return filename
     except Exception as e:
         print(f"Chart error {sym}: {e}")
-        return None, None, None
+        return None
 
-# --- Сбор данных (Снижен порог объема до 2 млн) ---
-def get_mexc_data():
+# --- Сбор данных ---
+def get_all_coins():
+    coins = []
     try:
         res = requests.get("https://contract.mexc.com/api/v1/contract/ticker", headers=HEADERS, timeout=10).json()
-        return [c for c in res.get('data', []) if c['symbol'].endswith('_USDT') and float(c.get('amount24', 0)) > 2000000] if res.get('success') else []
-    except: return []
-
-def get_bitget_data():
+        if res.get('success'):
+            coins += [{'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice'])} for c in res['data'] if c['symbol'].endswith('_USDT') and float(c.get('amount24', 0)) > 2000000]
+    except: pass
     try:
         res = requests.get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES", headers=HEADERS, timeout=10).json()
-        return [c for c in res.get('data', []) if float(c.get('usdtVolume', 0)) > 2000000] if res.get('code') == '00000' else []
-    except: return []
-
-# --- Проверка пампов (Снижен порог до 2%) ---
-def check_mexc_spike(sym):
-    try:
-        res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=5).json()
-        if res.get('success') and len(res['data']['close']) >= 2:
-            change = ((float(res['data']['close'][-1]) - float(res['data']['close'][-2])) / float(res['data']['close'][-2])) * 100
-            if change > 2.0: return change, float(res['data']['close'][-1])
+        if res.get('code') == '00000':
+            coins += [{'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr'])} for c in res['data'] if float(c.get('usdtVolume', 0)) > 2000000]
     except: pass
-    return None
-
-def check_bitget_spike(sym):
-    try:
-        res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=2", headers=HEADERS, timeout=5).json()
-        if res.get('code') == '00000' and len(res['data']) >= 2:
-            change = ((float(res['data'][0][4]) - float(res['data'][0][1])) / float(res['data'][0][1])) * 100
-            if change > 2.0: return change, float(res['data'][0][4])
-    except: pass
-    return None
+    return coins
 
 def main():
     if not BOT_TOKEN or not CHAT_ID: sys.exit(1)
-    print("Сканируем MEXC и Bitget на пампы (>2%)...")
+    print("Сканируем монеты на близость к EMA (1W)...")
+    
+    all_coins = get_all_coins()
+    # Убираем дубликаты (если монета есть и на MEXC, и на Bitget)
+    unique_coins = {c['sym']: c for c in all_coins}.values()
+    
     found = 0
-    
-    # Собираем монеты
-    coins = [{'ex': 'MEXC', 'sym': c['symbol']} for c in get_mexc_data()] + \
-            [{'ex': 'Bitget', 'sym': c['symbol']} for c in get_bitget_data()]
-    
-    unique_coins = {f"{c['ex']}_{c['sym']}": c for c in coins}.values()
-
-    # Проверяем до 100 монет
-    for coin in list(unique_coins)[:100]:
-        if found >= 3: break # Максимум 3 сигнала за раз, чтобы не спамить
-        sym, ex = coin['sym'], coin['ex']
+    # Проверяем первые 80 монет (чтобы не превысить лимиты API)
+    for coin in list(unique_coins)[:80]:
+        if found >= 3: break
         
-        spike = check_mexc_spike(sym) if ex == 'MEXC' else check_bitget_spike(sym)
-            
-        if spike:
-            change, price = spike
-            chart_file, emas, fibs = draw_chart(sym, ex)
-            
-            if chart_file and emas:
-                # Ищем ближайшую EMA сверху
-                nearest_ema, nearest_val, min_diff = None, 0, 999
-                for span, val in emas.items():
-                    if val > price:
-                        diff = ((val - price) / price) * 100
-                        if diff < min_diff:
-                            min_diff, nearest_ema, nearest_val = diff, span, val
+        sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
+        
+        df_1d, emas = get_data_and_emas(sym, ex)
+        if not emas: continue
 
-                text = f"⚡️ <b>ПАМП (15m) + Аналитика</b>\n"
+        # Ищем EMA, к которой цена ближе всего
+        best_ema_span = None
+        best_ema_val = 0
+        min_diff_pct = 999
+        
+        for span, val in emas.items():
+            # Считаем расстояние в процентах
+            diff_pct = abs(current_price - val) / val * 100
+            
+            # Если цена в пределах 2.5% от EMA (и EMA выше цены, т.е. это сопротивление)
+            if diff_pct < min_diff_pct and diff_pct < 2.5 and val > current_price * 0.98:
+                min_diff_pct = diff_pct
+                best_ema_span = span
+                best_ema_val = val
+
+        # Если нашли подходящую EMA (7, 14, 28, 50, 100, 200)
+        if best_ema_span:
+            chart_file = draw_chart(sym, df_1d, emas, best_ema_val)
+            if chart_file:
+                text = f"🧲 <b>ЦЕНА У УРОВНЯ EMA</b>\n"
                 text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym}</b>\n"
-                text += f"📈 Рост: <code>+{change:.2f}%</code> | 💰 Цена: <code>{price}</code>\n\n"
+                text += f"💰 Цена: <code>{current_price}</code>\n"
+                text += f"🎯 <b>EMA {best_ema_span} (1W):</b> <code>{best_ema_val:.4f}</code>\n"
+                text += f"📏 Расстояние: <code>{min_diff_pct:.2f}%</code>\n\n"
                 
-                if nearest_ema:
-                    text += f"🎯 <b>Ближайшее сопротивление (1W):</b>\n"
-                    text += f"├ <b>EMA {nearest_ema}: <code>{nearest_val:.4f}</code></b> ({(min_diff):.1f}%)\n"
-                    
-                    # Проверка на конфлюенс (совпадение EMA и Фибо)
-                    confluence = False
-                    if fibs:
-                        for fib_lvl, fib_val in fibs.items():
-                            if abs(fib_val - nearest_val) / nearest_val < 0.01: # Если разница меньше 1%
-                                confluence = True
-                                text += f"└ 📐 Совпадение с Fib {fib_lvl}!\n"
-                                break
-                    
-                    if confluence:
-                        text += f"\n🔥🔥 <b>КОНФЛЮЕНС!</b> Пересечение EMA и Фибо. Идеально для лимитки на шорт!\n"
-                    elif min_diff < 3.0:
-                        text += f"\n🔥 <b>ВНИМАНИЕ!</b> Цена почти у недельной EMA. Готовь шорт!\n"
-                    else:
-                        text += f"\n⚠️ До потолка еще далеко. Ждите.\n"
-                
-                text += f"\n📐 <b>Сетка Фибо (15m):</b>\n"
-                if fibs:
-                    for lvl, val in fibs.items():
-                        text += f"├ {lvl}: <code>{val:.4f}</code>\n"
+                if best_ema_span in [7, 14]:
+                    text += f"🔥 <b>Цена подошла к EMA {best_ema_span}!</b> Ставь лимитку на шорт прямо на этот уровень."
+                else:
+                    text += f"⚠️ Цена у EMA {best_ema_span}. Готовься к отскоку."
 
                 send_telegram_photo(chart_file, text)
                 os.remove(chart_file)
@@ -213,7 +157,7 @@ def main():
                 time.sleep(1)
 
     if found == 0:
-        print("Пампов нет.")
+        print("Нет монет у EMA.")
 
 if __name__ == "__main__":
     main()
