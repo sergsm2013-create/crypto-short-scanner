@@ -29,153 +29,158 @@ def send_telegram_photo(photo_path, caption):
 
 def draw_chart(sym, exchange):
     try:
-        df = None
+        df_15m, df_1w = None, None
+        
+        # 1. 15-минутные свечи (для графика и входа)
         if exchange == 'MEXC':
-            # MEXC: интервал 15 минут, свечи идут от старых к новым
-            url = f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15"
-            res = requests.get(url, headers=HEADERS, timeout=10).json()
+            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=10).json()
             if res.get('success'):
                 data = res['data']
-                df = pd.DataFrame({
+                df_15m = pd.DataFrame({
                     'time': pd.to_datetime(data['time'], unit='s'),
-                    'open': data['open'],
-                    'high': data['high'],
-                    'low': data['low'],
-                    'close': data['close'],
-                    'volume': data['vol']
+                    'open': data['open'], 'high': data['high'], 
+                    'low': data['low'], 'close': data['close'], 'volume': data['vol']
                 })
         elif exchange == 'Bitget':
-            # Bitget: интервал 15 минут, свечи идут от новых к старым
-            url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50"
-            res = requests.get(url, headers=HEADERS, timeout=10).json()
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=10).json()
             if res.get('code') == '00000':
                 data = res['data']
-                df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-                df = df.iloc[::-1] # Переворачиваем
-                df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms')
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = df[col].astype(float)
+                df_15m = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df_15m = df_15m.iloc[::-1]
+                df_15m['time'] = pd.to_datetime(df_15m['time'].astype(float), unit='ms')
+                for col in ['open', 'high', 'low', 'close', 'volume']: df_15m[col] = df_15m[col].astype(float)
 
-        if df is None or df.empty:
-            return None
+        # 2. Недельные свечи (для расчета EMA)
+        if exchange == 'MEXC':
+            res_1w = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Week1", headers=HEADERS, timeout=10).json()
+            if res_1w.get('success'):
+                df_1w = pd.DataFrame({'close': res_1w['data']['close']})
+        elif exchange == 'Bitget':
+            res_1w = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=1week&limit=200", headers=HEADERS, timeout=10).json()
+            if res_1w.get('code') == '00000':
+                df_1w = pd.DataFrame(res_1w['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df_1w['close'] = df_1w['close'].astype(float)
+                df_1w = df_1w.iloc[::-1] # Старые сначала
 
-        df.set_index('time', inplace=True)
+        if df_15m is None or df_15m.empty or df_1w is None or df_1w.empty: 
+            return None, None
+
+        df_15m.set_index('time', inplace=True)
+        
+        # Считаем EMA на Недельном (1W) графике
+        emas = {}
+        for span in [7, 14, 28, 50, 100]:
+            if len(df_1w) >= span: # Считаем только если хватает данных
+                emas[span] = df_1w['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+
         filename = f"{sym}_chart.png"
-        mpf.plot(df, type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m", tight_layout=True)
-        return filename
-    except Exception as e:
-        print(f"Chart error {sym} ({exchange}): {e}")
-        return None
+        
+        # Готовим горизонтальные линии для графика
+        lines = []
+        colors = []
+        for span, val in emas.items():
+            lines.append(val)
+            if span == 7: colors.append('blue')
+            elif span == 14: colors.append('orange')
+            elif span == 28: colors.append('purple')
+            elif span == 50: colors.append('green')
+            elif span == 100: colors.append('red')
 
+        hlines = dict(hlines=lines, colors=colors, linestyle='-', linewidths=1.5) if lines else None
+                      
+        mpf.plot(df_15m, type='candle', style='yahoo', volume=True, savefig=filename, 
+                 title=f"{sym} 15m | Lines = Weekly EMAs", tight_layout=True, hlines=hlines)
+        
+        return filename, emas
+    except Exception as e:
+        print(f"Chart error {sym}: {e}")
+        return None, None
+
+# (Функции сканирования без изменений)
 def get_mexc_data():
     try:
-        url = "https://contract.mexc.com/api/v1/contract/ticker"
-        res = requests.get(url, headers=HEADERS, timeout=10).json()
-        if not res.get('success'):
-            return []
-        return [c for c in res['data'] if c['symbol'].endswith('_USDT') and float(c.get('amount24', 0)) > 5000000]
-    except Exception as e:
-        print(f"MEXC tickers error: {e}")
-        return []
+        res = requests.get("https://contract.mexc.com/api/v1/contract/ticker", headers=HEADERS, timeout=10).json()
+        return [c for c in res.get('data', []) if c['symbol'].endswith('_USDT') and float(c.get('amount24', 0)) > 5000000] if res.get('success') else []
+    except: return []
 
 def get_bitget_data():
     try:
-        url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
-        res = requests.get(url, headers=HEADERS, timeout=10).json()
-        if res.get('code') != '00000':
-            return []
-        return [c for c in res['data'] if float(c.get('usdtVolume', 0)) > 5000000]
-    except Exception as e:
-        print(f"Bitget tickers error: {e}")
-        return []
+        res = requests.get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES", headers=HEADERS, timeout=10).json()
+        return [c for c in res.get('data', []) if float(c.get('usdtVolume', 0)) > 5000000] if res.get('code') == '00000' else []
+    except: return []
 
 def check_mexc_spike(sym):
     try:
-        url = f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15"
-        res = requests.get(url, headers=HEADERS, timeout=5).json()
-        if not res.get('success'): return None
-        data = res['data']
-        if len(data['close']) >= 2:
-            # Берем последнюю закрытую свечу
-            last_close = float(data['close'][-1])
-            prev_close = float(data['close'][-2])
-            change = ((last_close - prev_close) / prev_close) * 100
-            # ТЕСТОВЫЙ РЕЖИМ: порог 0.1%
-            if change > 0.1:
-                return change, last_close
-    except Exception:
-        pass
+        res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=5).json()
+        if res.get('success') and len(res['data']['close']) >= 2:
+            change = ((float(res['data']['close'][-1]) - float(res['data']['close'][-2])) / float(res['data']['close'][-2])) * 100
+            if change > 2.0: return change, float(res['data']['close'][-1]) # Чуть снизил порог до 2%, чтобы чаще ловить
+    except: pass
     return None
 
 def check_bitget_spike(sym):
     try:
-        url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=2"
-        res = requests.get(url, headers=HEADERS, timeout=5).json()
-        if res.get('code') != '00000': return None
-        data = res['data']
-        if len(data) >= 2:
-            # data[0] - текущая свеча, data[1] - прошлая
-            curr_open = float(data[0][1])
-            curr_close = float(data[0][4])
-            change = ((curr_close - curr_open) / curr_open) * 100
-            # ТЕСТОВЫЙ РЕЖИМ: порог 0.1%
-            if change > 0.1:
-                return change, curr_close
-    except Exception:
-        pass
+        res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=2", headers=HEADERS, timeout=5).json()
+        if res.get('code') == '00000' and len(res['data']) >= 2:
+            change = ((float(res['data'][0][4]) - float(res['data'][0][1])) / float(res['data'][0][1])) * 100
+            if change > 2.0: return change, float(res['data'][0][4])
+    except: pass
     return None
 
 def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        print("ОШИБКА: Нет токенов!")
-        sys.exit(1)
-
-    print("Сканируем MEXC и Bitget...")
+    if not BOT_TOKEN or not CHAT_ID: sys.exit(1)
+    print("Сканируем на пампы...")
     found = 0
-    coins_to_check = []
-
-    # Собираем монеты с MEXC
-    for c in get_mexc_data():
-        coins_to_check.append({'ex': 'MEXC', 'sym': c['symbol']})
+    coins = [{'ex': 'MEXC', 'sym': c['symbol']} for c in get_mexc_data()] + \
+            [{'ex': 'Bitget', 'sym': c['symbol']} for c in get_bitget_data()]
     
-    # Собираем монеты с Bitget
-    for c in get_bitget_data():
-        coins_to_check.append({'ex': 'Bitget', 'sym': c['symbol']})
+    unique_coins = {f"{c['ex']}_{c['sym']}": c for c in coins}.values()
 
-    # Убираем дубликаты и ограничиваем количество для теста
-    unique_coins = {f"{c['ex']}_{c['sym']}": c for c in coins_to_check}.values()
-    print(f"Найдено {len(list(unique_coins))} ликвидных пар для проверки.")
-
-    for coin in list(unique_coins)[:50]: # Ограничим 50 монетами для теста
+    for coin in list(unique_coins)[:70]:
         if found >= 3: break
-        
-        sym = coin['sym']
-        ex = coin['ex']
-        spike = None
-        
-        if ex == 'MEXC':
-            spike = check_mexc_spike(sym)
-        elif ex == 'Bitget':
-            spike = check_bitget_spike(sym)
+        sym, ex = coin['sym'], coin['ex']
+        spike = check_mexc_spike(sym) if ex == 'MEXC' else check_bitget_spike(sym)
             
         if spike:
             change, price = spike
-            print(f"Импульс: {ex} {sym} (+{change:.2f}%)")
-            chart_file = draw_chart(sym, ex)
+            chart_file, emas = draw_chart(sym, ex)
             
-            if chart_file:
-                text = f"⚡️ <b>ИМПУЛЬС (15m)</b>\n"
+            if chart_file and emas:
+                # Ищем ближайшую EMA сверху (сопротивление)
+                nearest_ema = None
+                nearest_val = 0
+                min_diff = 999
+                
+                for span, val in emas.items():
+                    if val > price: # Ищем только те, что выше текущей цены
+                        diff = ((val - price) / price) * 100
+                        if diff < min_diff:
+                            min_diff = diff
+                            nearest_ema = span
+                            nearest_val = val
+
+                text = f"⚡️ <b>ПАМП (15m)</b> + Недельные EMA\n"
                 text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym}</b>\n"
-                text += f"📈 Рост: <code>+{change:.2f}%</code>\n"
-                text += f"💰 Цена: <code>{price}</code>"
+                text += f"📈 Рост: <code>+{change:.2f}%</code> | 💰 Цена: <code>{price}</code>\n\n"
+                
+                if nearest_ema:
+                    text += f"🎯 <b>Ближайшее сопротивление (1W):</b>\n"
+                    text += f"├ EMA {nearest_ema}: <code>{nearest_val:.4f}</code> ({(min_diff):.1f}% сверху)\n\n"
+                    if min_diff < 3.0:
+                        text += f"🔥 <b>ВНИМАНИЕ!</b> Цена почти у недельной EMA. Идеальная точка для лимитки на шорт!"
+                    else:
+                        text += f"⚠️ До сопротивления еще далеко. Ждите."
+                else:
+                    text += f"🚀 Цена выше всех недельных EMA (Космос). Шорт опасен."
+
                 send_telegram_photo(chart_file, text)
                 os.remove(chart_file)
                 found += 1
-                time.sleep(1) # Пауза между сообщениями
+                time.sleep(1)
 
     if found == 0:
-        print("Импульсов нет.")
-        send_telegram_text("🤖 Бот работает на MEXC и Bitget. Сейчас на рынке нет сильных импульсов (рост > 0.1% за 15 мин).")
+        print("Пампов нет.")
+        send_telegram_text("🤖 Бот активен (Ищем шорт от 1W EMA). Ждем пампов.")
 
 if __name__ == "__main__":
     main()
