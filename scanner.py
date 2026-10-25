@@ -7,62 +7,95 @@ import sys
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
+def get_bybit():
+    try:
+        res = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=10).json()
+        pumps = []
+        for item in res.get('result', {}).get('list', []):
+            sym = item['symbol']
+            if sym.endswith("USDT"):
+                change = float(item['price24hPcnt']) * 100
+                vol = float(item['turnover24h'])
+                if change > 10 and vol > 5000000:
+                    pumps.append({"ex": "Bybit", "sym": sym, "change": change, "price": float(item['lastPrice']), "funding": float(item['fundingRate'])*100})
+        return pumps
+    except Exception as e:
+        print(f"Bybit error: {e}")
+        return []
+
+def get_bitunix():
+    try:
+        res = requests.get("https://fapi.bitunix.com/api/v1/futures/market/tickers", timeout=10).json()
+        pumps = []
+        for item in res.get('data', []):
+            sym = item.get('symbol', '')
+            if sym.endswith("USDT"):
+                change = float(item.get('change', 0))
+                if 0 < change < 1: change *= 100 # Приводим к процентам
+                vol = float(item.get('quoteVol', 0) or item.get('quoteVolume', 0))
+                if change > 10 and vol > 5000000:
+                    pumps.append({"ex": "Bitunix", "sym": sym, "change": change, "price": float(item.get('lastPrice',0)), "funding": float(item.get('fundingRate',0))*100})
+        return pumps
+    except Exception as e:
+        print(f"Bitunix error: {e}")
+        return []
+
+def get_mexc():
+    try:
+        res = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=10).json()
+        pumps = []
+        for item in res.get('data', []):
+            sym = item.get('symbol', '')
+            if sym.endswith("_USDT"):
+                change = float(item.get('riseFallRate', 0)) * 100
+                vol = float(item.get('amount24', 0))
+                if change > 10 and vol > 5000000:
+                    pumps.append({"ex": "MEXC", "sym": sym, "change": change, "price": float(item.get('lastPrice',0)), "funding": float(item.get('fundingRate',0))*100})
+        return pumps
+    except Exception as e:
+        print(f"MEXC error: {e}")
+        return []
+
+def get_7d_high(ex, sym):
+    try:
+        if ex == "Bybit":
+            url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={sym}&interval=60&limit=168"
+            r = requests.get(url, timeout=5).json()
+            return max([float(k[2]) for k in r['result']['list'][1:]])
+        elif ex == "Bitunix":
+            url = f"https://fapi.bitunix.com/api/v1/futures/market/kline?symbol={sym}&interval=1h&limit=168"
+            r = requests.get(url, timeout=5).json()
+            return max([float(k['high']) for k in r['data'][:-1]])
+        elif ex == "MEXC":
+            url = f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min60"
+            r = requests.get(url, timeout=5).json()
+            return max(r['data']['high'])
+    except Exception as e:
+        print(f"Kline error {ex} {sym}: {e}")
+        return None
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
-        print("ОШИБКА: Не найдены BOT_TOKEN или CHAT_ID в секретах!")
+        print("ОШИБКА: Нет токенов!")
         sys.exit(1)
 
-    print("Сканируем рынок...")
-    tickers_url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    print("Сканируем Bybit, Bitunix, MEXC...")
     
-    try:
-        response = requests.get(tickers_url, timeout=10)
-        res = response.json()
-    except Exception as e:
-        print(f"ОШИБКА СЕТИ: {e}")
-        sys.exit(1)
+    # Собираем пампы со всех трех бирж
+    all_pumps = get_bybit() + get_bitunix() + get_mexc()
+    
+    # Сортируем по росту и берем ТОП-7
+    all_pumps.sort(key=lambda x: x['change'], reverse=True)
+    top_pumps = all_pumps[:7]
 
-    # ЖЕСТКАЯ ПРОВЕРКА НА БЛОКИРОВКУ
-    if not isinstance(res, list):
-        print(f"ОШИБКА BINANCE (сервер заблокирован или неверный ответ): {res}")
-        sys.exit(1)
+    text = "🎯 <b>ЦЕЛИ ДЛЯ ШОРТА (Мульти-биржа)</b>\n\n"
+    found = False
 
-    pumps = []
-    for item in res:
-        try:
-            symbol = item.get('symbol', '')
-            if symbol.endswith("USDT"):
-                price_change = float(item.get('priceChangePercent', 0))
-                volume = float(item.get('quoteVolume', 0))
-                if price_change > 10 and volume > 5000000:
-                    pumps.append({"sym": symbol, "change": price_change, "current_price": float(item.get('lastPrice', 0))})
-        except Exception:
-            pass
-
-    pumps.sort(key=lambda x: x['change'], reverse=True)
-    top_pumps = pumps[:5]
-
-    funding_url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-    try:
-        funding_res = requests.get(funding_url, timeout=10).json()
-        if not isinstance(funding_res, list):
-             raise Exception("Ошибка API фандинга")
-        funding_dict = {item['symbol']: float(item['lastFundingRate']) * 100 for item in funding_res}
-    except Exception as e:
-        print(f"Ошибка фандинга: {e}")
-        funding_dict = {}
-
-    final_list = []
     for p in top_pumps:
-        sym = p['sym']
-        try:
-            klines_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={sym}&interval=1h&limit=168"
-            klines = requests.get(klines_url, timeout=5).json()
-            if not isinstance(klines, list):
-                raise Exception("Ошибка API свечей")
-            high_7d = max([float(k[2]) for k in klines[:-1]]) 
-            current_price = p['current_price']
-            
+        high_7d = get_7d_high(p['ex'], p['sym'])
+        if high_7d:
+            found = True
+            current_price = p['price']
             if current_price >= high_7d:
                 target_level = high_7d
                 status = "🚀 ПРОБОЙ"
@@ -70,22 +103,21 @@ def main():
                 target_level = high_7d
                 status = "📈 ЛЕТИМ К МАКС"
                 
-            p['funding'] = funding_dict.get(sym, 0)
-            p['target'] = target_level
-            p['status'] = status
-            final_list.append(p)
-        except Exception as e:
-            print(f"Ошибка при анализе {sym}: {e}")
+            text += f"🏦 <b>{p['ex']}</b> | 🪙 <b>{p['sym']}</b>\n"
+            text += f"├ Рост: <code>+{p['change']:.1f}%</code>\n"
+            text += f"├ Фандинг: <code>{p['funding']:.4f}%</code>\n"
+            text += f"├ Цена: <code>{current_price}</code>\n"
+            text += f"└ Цель (7д): <b><code>{target_level}</code></b> {status}\n\n"
+        else:
+            # Если не удалось получить свечи, показываем хотя бы просто памп
+            found = True
+            text += f"🏦 <b>{p['ex']}</b> | 🪙 <b>{p['sym']}</b>\n"
+            text += f"├ Рост: <code>+{p['change']:.1f}%</code>\n"
+            text += f"├ Фандинг: <code>{p['funding']:.4f}%</code>\n"
+            text += f"└ Цель: <i>нет данных</i>\n\n"
 
-    text = "🎯 <b>ЦЕЛИ ДЛЯ ШОРТА (Пампы + Уровни)</b>\n\n"
-    if final_list:
-        for f in final_list:
-            text += f"🪙 <b>{f['sym']}</b> | <code>+{f['change']:.1f}%</code>\n"
-            text += f"├ Фандинг: <code>{f['funding']:.4f}%</code>\n"
-            text += f"├ Текущая: <code>{f['current_price']}</code>\n"
-            text += f"└ Цель (7д): <b><code>{f['target']}</code></b> {f['status']}\n\n"
-    else:
-        text += "Сейчас нет подходящих пампов."
+    if not found:
+        text += "Сейчас нет пампов (>10%) на выбранных биржах."
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}).encode('utf-8')
@@ -96,7 +128,6 @@ def main():
             print("Успех! Сигналы отправлены!")
     except Exception as e:
         print(f"ОШИБКА ТЕЛЕГРАМ: {e}")
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()
