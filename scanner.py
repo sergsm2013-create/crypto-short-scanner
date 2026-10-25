@@ -15,7 +15,7 @@ HEADERS = {
 }
 
 # ==========================================
-# БЛОК 1: ОПЦИОННЫЕ УРОВНИ (DERIBIT)
+# БЛОК 1: ОПЦИОННЫЕ УРОВНИ (DERIBIT) - для BTC/ETH
 # ==========================================
 def fetch_deribit_options(currency="BTC"):
     url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={currency}&kind=option"
@@ -82,7 +82,7 @@ def send_telegram_text(text):
         print(f"TG text error: {e}")
 
 # ==========================================
-# БЛОК 3: АНАЛИЗ EMA И ГРАФИКИ
+# БЛОК 3: EMA И ГРАФИКИ
 # ==========================================
 def get_weekly_emas(sym, exchange):
     try:
@@ -137,11 +137,11 @@ def draw_chart(sym, exchange, target_ema_val):
         return None
 
 # ==========================================
-# БЛОК 4: СБОР ДАННЫХ И СКАНИРОВАНИЕ
+# БЛОК 4: СБОР ДАННЫХ И ПОИСК РЕЗКИХ ПАМПОВ
 # ==========================================
 def get_all_coins():
     coins = []
-    HIGH_LIQ, MID_LIQ, MIN_VOLATILITY = 50_000_000, 10_000_000, 8.0 
+    HIGH_LIQ, MID_LIQ, MIN_VOLATILITY = 50_000_000, 5_000_000, 8.0 
 
     try:
         res = requests.get("https://contract.mexc.com/api/v1/contract/ticker", headers=HEADERS, timeout=10).json()
@@ -153,8 +153,7 @@ def get_all_coins():
                     if volatility > MIN_VOLATILITY:
                         liq_type = "HIGH" if vol > HIGH_LIQ else "MID"
                         coins.append({'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice']), 'liq': liq_type, 'volat': volatility})
-    except: 
-        pass
+    except: pass
 
     try:
         res = requests.get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES", headers=HEADERS, timeout=10).json()
@@ -166,32 +165,30 @@ def get_all_coins():
                     if volatility > MIN_VOLATILITY:
                         liq_type = "HIGH" if vol > HIGH_LIQ else "MID"
                         coins.append({'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr']), 'liq': liq_type, 'volat': volatility})
-    except: 
-        pass
+    except: pass
     return coins
 
-def check_hourly_pump(sym, exchange):
-    """Ищем накопленный памп за 1 час (4 свечи по 15м) от 4% до 9%"""
+def check_fast_pump(sym, exchange):
+    """Ищем резкий спайк 5.5% - 10% за ОДНУ 15-минутную свечу (как на скринах)"""
     try:
         if exchange == 'MEXC':
             res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=5).json()
-            if res.get('success') and len(res['data']['close']) >= 5:
+            if res.get('success') and len(res['data']['close']) >= 2:
                 current_price = float(res['data']['close'][-1])
-                price_1h_ago = float(res['data']['close'][-5])
-                change = ((current_price - price_1h_ago) / price_1h_ago) * 100
-                if 4.0 <= change <= 9.0: 
+                open_price = float(res['data']['open'][-1]) # Открытие текущей 15-мин свечи
+                change = ((current_price - open_price) / open_price) * 100
+                if 5.5 <= change <= 12.0: 
                     return change
                     
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=5", headers=HEADERS, timeout=5).json()
-            if res.get('code') == '00000' and len(res['data']) >= 5:
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=2", headers=HEADERS, timeout=5).json()
+            if res.get('code') == '00000' and len(res['data']) >= 2:
                 current_price = float(res['data'][0][4])
-                price_1h_ago = float(res['data'][4][4])
-                change = ((current_price - price_1h_ago) / price_1h_ago) * 100
-                if 4.0 <= change <= 9.0: 
+                open_price = float(res['data'][0][1])
+                change = ((current_price - open_price) / open_price) * 100
+                if 5.5 <= change <= 12.0: 
                     return change
-    except: 
-        pass
+    except: pass
     return None
 
 # ==========================================
@@ -201,7 +198,7 @@ def main():
     if not BOT_TOKEN or not CHAT_ID: 
         sys.exit(1)
         
-    print("Сканируем рынок на часовые пампы (4-9%)...")
+    print("Сканируем рынок на резкие спайки (5.5% - 12%)...")
     
     btc_options = calculate_options_levels(fetch_deribit_options("BTC"))
     eth_options = calculate_options_levels(fetch_deribit_options("ETH"))
@@ -216,7 +213,7 @@ def main():
         
         sym, ex, current_price, liq, volat = coin['sym'], coin['ex'], coin['price'], coin['liq'], coin['volat']
         
-        pump_change = check_hourly_pump(sym, ex)
+        pump_change = check_fast_pump(sym, ex)
         if not pump_change: 
             continue
 
@@ -233,17 +230,18 @@ def main():
                     best_ema_name = span
                     best_ema_val = val
 
-        if best_ema_name and 0.5 <= min_diff_pct <= 5.0:
+        # Если цена подошла к EMA (или уже пробила её)
+        if best_ema_name and 0.1 <= min_diff_pct <= 5.0:
             chart_file = draw_chart(sym, ex, best_ema_val)
             if chart_file:
                 liq_badge = "🟢 HIGH" if liq == "HIGH" else "🟡 MID"
                 
-                text = f"🚀 <b>ПАМП ЗА 1 ЧАС (+{pump_change:.2f}%)</b>\n"
+                text = f"🚀 <b>РЕЗКИЙ ПАМП (+{pump_change:.2f}% за 15м)</b>\n"
                 text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym}</b>\n"
                 text += f"💧 Ликвидность: <b>{liq_badge} LIQ</b>\n"
                 text += f"🔥 Волатильность (24ч): <b>{volat:.1f}%</b>\n"
                 text += f"💰 Цена: <code>{current_price}</code>\n\n"
-                text += f"🎯 <b>Летит прямо в EMA {best_ema_name} (1W)!</b>\n"
+                text += f"🎯 <b>Цель: EMA {best_ema_name} (1W)</b>\n"
                 text += f"├ Уровень (Лимитка): <code>{best_ema_val:.4f}</code>\n"
                 text += f"└ Осталось: <b><code>{min_diff_pct:.2f}%</code></b>\n\n"
 
@@ -257,13 +255,9 @@ def main():
                         call_wall = min([w for w in opt_levels['call_walls'] if w['strike'] > current_price], key=lambda x: x['strike'], default=None)
                         if call_wall: 
                             text += f"├ Call Wall (Сопр.): <code>{call_wall['strike']}</code>\n"
-                    if opt_levels['put_walls']:
-                        put_wall = max([w for w in opt_levels['put_walls'] if w['strike'] < current_price], key=lambda x: x['strike'], default=None)
-                        if put_wall: 
-                            text += f"└ Put Wall (Поддержка): <code>{put_wall['strike']}</code>\n"
                     text += "\n"
 
-                text += f"⚡️ <i>Срочно ставь лимитку на шорт!</i>"
+                text += f"⚡️ <i>Идеальная точка для шорта по тренду!</i>"
 
                 send_telegram_photo(chart_file, text)
                 os.remove(chart_file)
@@ -271,8 +265,9 @@ def main():
                 time.sleep(1)
 
     if found == 0:
-        print("Нет подходящих аномалий.")
-        send_telegram_text("🤖 Бот работает. Сейчас на рынке нет подходящих пампов (4-9% за час) с подходом к EMA.")
+        print("Нет сигналов.")
+        # Можно раскомментировать строчку ниже, если хотите получать отчет каждые 15 минут
+        # send_telegram_text("🤖 Бот работает. Резких спайков (от 5.5%) прямо сейчас нет.")
 
 if __name__ == "__main__":
     main()
