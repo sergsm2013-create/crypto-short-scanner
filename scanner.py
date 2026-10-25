@@ -25,7 +25,6 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-# --- 1. Получаем EMA 7, 14, 28 на недельном графике ---
 def get_weekly_emas(sym, exchange):
     try:
         df_1w = None
@@ -47,7 +46,6 @@ def get_weekly_emas(sym, exchange):
         }
     except: return None
 
-# --- 2. Рисуем график (15м) с линиями EMA ---
 def draw_chart(sym, exchange, target_ema_val):
     try:
         filename = f"{sym}_chart.png"
@@ -56,11 +54,7 @@ def draw_chart(sym, exchange, target_ema_val):
             res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=10).json()
             if res.get('success'):
                 data = res['data']
-                df_15m = pd.DataFrame({
-                    'time': pd.to_datetime(data['time'], unit='s'),
-                    'open': data['open'], 'high': data['high'], 
-                    'low': data['low'], 'close': data['close'], 'volume': data['vol']
-                })
+                df_15m = pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close'], 'volume': data['vol']})
         elif exchange == 'Bitget':
             res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=10).json()
             if res.get('code') == '00000':
@@ -72,36 +66,58 @@ def draw_chart(sym, exchange, target_ema_val):
 
         if df_15m is None or df_15m.empty: return None
         df_15m.set_index('time', inplace=True)
-        
         hlines = dict(hlines=[target_ema_val], colors=['green'], linestyle='-', linewidths=2.0)
-        mpf.plot(df_15m, type='candle', style='yahoo', volume=True, savefig=filename, 
-                 title=f"{sym} 15m | Target: {target_ema_val:.4f}", tight_layout=True, hlines=hlines)
+        mpf.plot(df_15m, type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | Target: {target_ema_val:.4f}", tight_layout=True, hlines=hlines)
         return filename
     except: return None
 
-# --- 3. Сбор данных и поиск аномалий ---
+# 🔥 ОБНОВЛЕННАЯ ФУНКЦИЯ СБОРА (ЛИКВИДНОСТЬ + ВОЛАТИЛЬНОСТЬ) 🔥
 def get_all_coins():
     coins = []
+    
+    HIGH_LIQ = 50_000_000  # $50 млн
+    MID_LIQ = 10_000_000   # $10 млн
+    MIN_VOLATILITY = 8.0   # Волатильность минимум 8% за 24ч (High-Low)
+
     try:
         res = requests.get("https://contract.mexc.com/api/v1/contract/ticker", headers=HEADERS, timeout=10).json()
         if res.get('success'):
-            coins += [{'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice'])} for c in res['data'] if c['symbol'].endswith('_USDT') and float(c.get('amount24', 0)) > 2000000]
+            for c in res['data']:
+                vol = float(c.get('amount24', 0))
+                high = float(c.get('high24h', 0))
+                low = float(c.get('low24h', 0))
+                
+                if c['symbol'].endswith('_USDT') and vol > MID_LIQ and low > 0:
+                    volatility = ((high - low) / low) * 100
+                    if volatility > MIN_VOLATILITY:
+                        liq_type = "HIGH" if vol > HIGH_LIQ else "MID"
+                        coins.append({'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice']), 'liq': liq_type, 'volat': volatility})
     except: pass
+
     try:
         res = requests.get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES", headers=HEADERS, timeout=10).json()
         if res.get('code') == '00000':
-            coins += [{'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr'])} for c in res['data'] if float(c.get('usdtVolume', 0)) > 2000000]
+            for c in res['data']:
+                vol = float(c.get('usdtVolume', 0))
+                high = float(c.get('high24h', 0))
+                low = float(c.get('low24h', 0))
+                
+                if vol > MID_LIQ and low > 0:
+                    volatility = ((high - low) / low) * 100
+                    if volatility > MIN_VOLATILITY:
+                        liq_type = "HIGH" if vol > HIGH_LIQ else "MID"
+                        coins.append({'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr']), 'liq': liq_type, 'volat': volatility})
     except: pass
+
     return coins
 
 def check_spike(sym, exchange):
-    """Проверяем, был ли памп (аномалия) за последние 15 минут"""
     try:
         if exchange == 'MEXC':
             res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=5).json()
             if res.get('success') and len(res['data']['close']) >= 2:
                 change = ((float(res['data']['close'][-1]) - float(res['data']['close'][-2])) / float(res['data']['close'][-2])) * 100
-                if change > 2.0: return change # Порог 2%
+                if change > 2.0: return change
         elif exchange == 'Bitget':
             res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=2", headers=HEADERS, timeout=5).json()
             if res.get('code') == '00000' and len(res['data']) >= 2:
@@ -112,41 +128,41 @@ def check_spike(sym, exchange):
 
 def main():
     if not BOT_TOKEN or not CHAT_ID: sys.exit(1)
-    print("Сканируем аномалии и цели EMA...")
+    print("Сканируем ликвидные и волатильные монеты...")
     
     all_coins = get_all_coins()
     unique_coins = {c['sym']: c for c in all_coins}.values()
     
     found = 0
-    for coin in list(unique_coins)[:100]:
+    for coin in list(unique_coins):
         if found >= 3: break
         
-        sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
+        sym, ex, current_price, liq, volat = coin['sym'], coin['ex'], coin['price'], coin['liq'], coin['volat']
         
-        # Шаг 1: Ищем памп (аномалию) прямо сейчас
         spike_change = check_spike(sym, ex)
-        if not spike_change: continue # Если пампа нет, идем дальше
+        if not spike_change: continue
 
-        # Шаг 2: Если памп есть, смотрим недельные EMA
         emas = get_weekly_emas(sym, ex)
         if not emas: continue
 
-        # Шаг 3: Ищем ближайшую EMA сверху
         best_ema_name, best_ema_val, min_diff_pct = None, 0, 999
         for span, val in emas.items():
-            if val > current_price: # Только EMA выше текущей цены (куда летим)
+            if val > current_price:
                 diff_pct = ((val - current_price) / current_price) * 100
                 if diff_pct < min_diff_pct:
                     min_diff_pct = diff_pct
                     best_ema_name = span
                     best_ema_val = val
 
-        # Шаг 4: Если памп летит прямо в EMA (от 0.5% до 5% до нее)
         if best_ema_name and 0.5 <= min_diff_pct <= 5.0:
             chart_file = draw_chart(sym, ex, best_ema_val)
             if chart_file:
+                liq_badge = "🟢 HIGH" if liq == "HIGH" else "🟡 MID"
+                
                 text = f"🚀 <b>АНОМАЛИЯ (ПАМП +{spike_change:.2f}%)</b>\n"
                 text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym}</b>\n"
+                text += f"💧 Ликвидность: <b>{liq_badge} LIQ</b>\n"
+                text += f"🔥 Волатильность (24ч): <b>{volat:.1f}%</b>\n"
                 text += f"💰 Цена: <code>{current_price}</code>\n\n"
                 text += f"🎯 <b>Летит прямо в EMA {best_ema_name} (1W)!</b>\n"
                 text += f"├ Уровень (Лимитка): <code>{best_ema_val:.4f}</code>\n"
@@ -159,7 +175,7 @@ def main():
                 time.sleep(1)
 
     if found == 0:
-        print("Нет пампов летящих в EMA.")
+        print("Нет подходящих аномалий.")
 
 if __name__ == "__main__":
     main()
