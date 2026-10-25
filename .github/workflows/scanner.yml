@@ -2,7 +2,7 @@ name: Crypto Short Scanner
 
 on:
   schedule:
-    - cron: '0 * * * *' # Запуск каждый час (по Гринвичу)
+    - cron: '*/15 * * * *' # Запуск каждый час (по Гринвичу)
   workflow_dispatch: # Позволяет запустить вручную кнопкой
 
 jobs:
