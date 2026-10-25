@@ -42,7 +42,7 @@ def check_15m_change(sym):
             change = ((current_close - current_open) / current_open) * 100
             
             # Если рост за 15 минут больше 3%
-            if change > 3.0:
+            if change > 0.1:
                 return change
     except Exception:
         pass
