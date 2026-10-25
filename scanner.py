@@ -17,14 +17,12 @@ HEADERS = {
 # ==========================================
 # БЛОК 1: ОПЦИОННЫЕ УРОВНИ (DERIBIT)
 # ==========================================
-
 def fetch_deribit_options(currency="BTC"):
     url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={currency}&kind=option"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10).json()
         return res.get('result', [])
-    except Exception as e:
-        print(f"Deribit API error: {e}")
+    except Exception:
         return []
 
 def parse_instrument_name(name):
@@ -68,7 +66,6 @@ def calculate_options_levels(options_data):
 # ==========================================
 # БЛОК 2: ОТПРАВКА В ТЕЛЕГРАМ
 # ==========================================
-
 def send_telegram_photo(photo_path, caption):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     try:
@@ -87,7 +84,6 @@ def send_telegram_text(text):
 # ==========================================
 # БЛОК 3: АНАЛИЗ EMA И ГРАФИКИ
 # ==========================================
-
 def get_weekly_emas(sym, exchange):
     try:
         df_1w = None
@@ -137,14 +133,12 @@ def draw_chart(sym, exchange, target_ema_val):
         hlines = dict(hlines=[target_ema_val], colors=['green'], linestyle='-', linewidths=2.0)
         mpf.plot(df_15m, type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | Target: {target_ema_val:.4f}", tight_layout=True, hlines=hlines)
         return filename
-    except Exception as e: 
-        print(f"Chart error: {e}")
+    except: 
         return None
 
 # ==========================================
 # БЛОК 4: СБОР ДАННЫХ И СКАНИРОВАНИЕ
 # ==========================================
-
 def get_all_coins():
     coins = []
     HIGH_LIQ, MID_LIQ, MIN_VOLATILITY = 50_000_000, 10_000_000, 8.0 
@@ -176,19 +170,25 @@ def get_all_coins():
         pass
     return coins
 
-def check_spike(sym, exchange):
+def check_hourly_pump(sym, exchange):
+    """Ищем накопленный памп за 1 час (4 свечи по 15м) от 4% до 9%"""
     try:
         if exchange == 'MEXC':
             res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=5).json()
-            if res.get('success') and len(res['data']['close']) >= 2:
-                change = ((float(res['data']['close'][-1]) - float(res['data']['close'][-2])) / float(res['data']['close'][-2])) * 100
-                if change > 2.0: 
+            if res.get('success') and len(res['data']['close']) >= 5:
+                current_price = float(res['data']['close'][-1])
+                price_1h_ago = float(res['data']['close'][-5])
+                change = ((current_price - price_1h_ago) / price_1h_ago) * 100
+                if 4.0 <= change <= 9.0: 
                     return change
+                    
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=2", headers=HEADERS, timeout=5).json()
-            if res.get('code') == '00000' and len(res['data']) >= 2:
-                change = ((float(res['data'][0][4]) - float(res['data'][0][1])) / float(res['data'][0][1])) * 100
-                if change > 2.0: 
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=5", headers=HEADERS, timeout=5).json()
+            if res.get('code') == '00000' and len(res['data']) >= 5:
+                current_price = float(res['data'][0][4])
+                price_1h_ago = float(res['data'][4][4])
+                change = ((current_price - price_1h_ago) / price_1h_ago) * 100
+                if 4.0 <= change <= 9.0: 
                     return change
     except: 
         pass
@@ -197,14 +197,12 @@ def check_spike(sym, exchange):
 # ==========================================
 # БЛОК 5: ГЛАВНЫЙ ЦИКЛ
 # ==========================================
-
 def main():
     if not BOT_TOKEN or not CHAT_ID: 
         sys.exit(1)
         
-    print("Сканируем рынок (Пампы + EMA + Опционы)...")
+    print("Сканируем рынок на часовые пампы (4-9%)...")
     
-    print("Загрузка опционов Deribit...")
     btc_options = calculate_options_levels(fetch_deribit_options("BTC"))
     eth_options = calculate_options_levels(fetch_deribit_options("ETH"))
 
@@ -218,8 +216,8 @@ def main():
         
         sym, ex, current_price, liq, volat = coin['sym'], coin['ex'], coin['price'], coin['liq'], coin['volat']
         
-        spike_change = check_spike(sym, ex)
-        if not spike_change: 
+        pump_change = check_hourly_pump(sym, ex)
+        if not pump_change: 
             continue
 
         emas = get_weekly_emas(sym, ex)
@@ -240,7 +238,7 @@ def main():
             if chart_file:
                 liq_badge = "🟢 HIGH" if liq == "HIGH" else "🟡 MID"
                 
-                text = f"🚀 <b>АНОМАЛИЯ (ПАМП +{spike_change:.2f}%)</b>\n"
+                text = f"🚀 <b>ПАМП ЗА 1 ЧАС (+{pump_change:.2f}%)</b>\n"
                 text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym}</b>\n"
                 text += f"💧 Ликвидность: <b>{liq_badge} LIQ</b>\n"
                 text += f"🔥 Волатильность (24ч): <b>{volat:.1f}%</b>\n"
@@ -250,11 +248,7 @@ def main():
                 text += f"└ Осталось: <b><code>{min_diff_pct:.2f}%</code></b>\n\n"
 
                 base_coin = sym.split('_')[0].replace('USDT', '')
-                opt_levels = None
-                if base_coin == 'BTC': 
-                    opt_levels = btc_options
-                elif base_coin == 'ETH': 
-                    opt_levels = eth_options
+                opt_levels = btc_options if base_coin == 'BTC' else (eth_options if base_coin == 'ETH' else None)
 
                 if opt_levels:
                     text += f"🏦 <b>ОПЦИОННЫЕ УРОВНИ (Deribit):</b>\n"
@@ -278,6 +272,7 @@ def main():
 
     if found == 0:
         print("Нет подходящих аномалий.")
+        send_telegram_text("🤖 Бот работает. Сейчас на рынке нет подходящих пампов (4-9% за час) с подходом к EMA.")
 
 if __name__ == "__main__":
     main()
