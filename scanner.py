@@ -17,60 +17,67 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-# --- Проверка глобального тренда (1D) ---
-def check_daily_trend(sym, exchange):
-    try:
-        if exchange == 'MEXC':
-            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Day1", headers=HEADERS, timeout=3).json()
-            if res.get('success'): df = pd.DataFrame({'close': [float(c) for c in res['data']['close']]})
-        elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=1D&limit=100", headers=HEADERS, timeout=3).json()
-            if res.get('code') == '00000': df = pd.DataFrame({'close': [float(c[4]) for c in res['data']][::-1]})
-        if len(df) < 50: return True 
-        ema50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        return df['close'].iloc[-1] < ema50 
-    except: return True
-
-# --- Поиск EMA (строго сверху и не дальше 3%) ---
-def get_target_emas(sym, exchange, current_price):
-    emas = {}
-    timeframes = {"MEXC": ["Min60", "Hour4", "Day1", "Week1", "Month1"], "Bitget": ["1H", "4H", "1D", "1week", "1M"]}
+# --- ПОИСК ЗОНЫ ПЛОТНОСТИ (EMA + Исторический хай) ---
+def find_density_zone(sym, exchange, current_price):
+    zones = []
+    timeframes = {"MEXC": ["Min60", "Hour4", "Day1", "Week1"], "Bitget": ["1H", "4H", "1D", "1week"]}
+    
     for tf in timeframes[exchange]:
         try:
             if exchange == 'MEXC':
                 res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={tf}", headers=HEADERS, timeout=3).json()
-                if res.get('success') and 'close' in res['data']: df = pd.DataFrame({'close': res['data']['close']})
-                else: continue
+                if not res.get('success'): continue
+                data = res['data']
+                df = pd.DataFrame({'high': [float(h) for h in data['high']], 'close': [float(c) for c in data['close']]})
             elif exchange == 'Bitget':
-                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=200", headers=HEADERS, timeout=3).json()
-                if res.get('code') == '00000' and res.get('data'):
-                    df = pd.DataFrame(res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-                    df['close'] = df['close'].astype(float)
-                else: continue
-            tf_name = tf.replace('Min60', '1H').replace('Hour4', '4H').replace('Day1', '1D').replace('Week1', '1W').replace('Month1', '1M').replace('1week', '1W')
+                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=100", headers=HEADERS, timeout=3).json()
+                if res.get('code') != '00000': continue
+                data = res['data']
+                df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                for col in ['high', 'close']: df[col] = df[col].astype(float)
 
-            for span in [7, 14, 28, 50]:
-                if len(df) >= span:
-                    val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
-                    # Берем ТОЛЬКО EMA, которые ВЫШЕ цены
-                    if val > current_price:
-                        diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 3.0: # Не дальше 3% (чтобы был быстрый вход)
-                            emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
-            time.sleep(0.1)
+            if len(df) < 50: continue
+            
+            # Считаем EMA 7, 14, 28
+            ema7 = df['close'].ewm(span=7, adjust=False).mean().iloc[-1]
+            ema14 = df['close'].ewm(span=14, adjust=False).mean().iloc[-1]
+            ema28 = df['close'].ewm(span=28, adjust=False).mean().iloc[-1]
+
+            # Ищем исторический максимум (High) за последние 50 свечей
+            hist_high = df['high'].iloc[-50:].max()
+
+            # Проверяем, есть ли СЛИЯНИЕ (Конфлюенс): 
+            # Если EMA находится близко к историческому максимуму (разница < 0.5%)
+            # и обе находятся над текущей ценой
+            tf_name = tf.replace('Min60', '1H').replace('Hour4', '4H').replace('Day1', '1D').replace('Week1', '1W').replace('1week', '1W')
+            
+            for name, val in [("EMA 7", ema7), ("EMA 14", ema14), ("EMA 28", ema28)]:
+                if val > current_price and hist_high > current_price:
+                    diff = abs(val - hist_high) / hist_high * 100
+                    if diff < 0.5: # Если EMA и исторический хай совпадают
+                        zones.append({
+                            'tf': tf_name, 
+                            'level': max(val, hist_high), # Берем пик этой зоны
+                            'type': 'Плотность (EMA + High)',
+                            'diff': ((max(val, hist_high) - current_price) / current_price) * 100
+                        })
         except: pass
-    return emas
+    
+    if not zones: return None
+    # Берем самую близкую зону
+    return min(zones, key=lambda x: x['diff'])
 
-def draw_chart(sym, df_15m, target_val, target_name):
+def draw_chart(sym, df_15m, target_val, zone_info):
     try:
         filename = f"{sym}_chart.png"
         df = df_15m.copy()
         df.set_index('time', inplace=True)
         
-        # Красная линия - потолок
+        # Рисуем красную линию на уровне плотности
         hlines = dict(hlines=[target_val], colors=['red'], linestyle='-', linewidths=2.0)
         
-        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | {target_name}", tight_layout=True, hlines=hlines)
+        title = f"{sym} 15m | Density: {zone_info['tf']} {zone_info['type']}"
+        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=title, tight_layout=True, hlines=hlines)
         return filename
     except: return None
 
@@ -132,40 +139,44 @@ def main():
         df_15m = get_15m_data(sym, ex)
         if df_15m is None or len(df_15m) < 30: continue
         
-        # 1. Ищем памп (от 5%)
+        # 1. Ищем памп (от 3%)
         open_p = df_15m['open'].iloc[-1]
         pump_change = ((current_price - open_p) / open_p) * 100
-        if pump_change < 5.0: continue
+        if pump_change < 3.0: continue
 
-        # 2. Тренд
-        if not check_daily_trend(sym, ex): continue
+        # 2. Ищем ЗОНУ ПЛОТНОСТИ (где EMA совпадает с историческим хаем)
+        zone = find_density_zone(sym, ex, current_price)
+        if not zone: continue # Если нет плотности, пропускаем
 
-        # 3. Ищем потолок СТРОГО СВЕРХУ (макс 3% расстояния)
-        target_emas = get_target_emas(sym, ex, current_price)
-        if not target_emas: continue # Если нет потолка, пропускаем (никаких старых зон снизу!)
-        
-        # Берем самую близкую EMA
-        best_name, best_data = min(target_emas.items(), key=lambda x: x[1]['diff'])
-
-        chart_file = draw_chart(sym, df_15m, best_data['val'], best_name)
-        
-        if chart_file:
-            base_coin = sym.split('_')[0].replace('USDT', '')
+        # 3. Если до зоны осталось меньше 2%
+        if zone['diff'] <= 2.0:
+            chart_file = draw_chart(sym, df_15m, zone['level'], zone)
             
-            text = f"🚀 <b>{base_coin}</b>\n"
-            text += f"Pump: <b>{pump_change:.2f}%</b>\n"
-            text += f"{open_p:.4f} -> {current_price:.4f}\n\n"
-            
-            text += f"🎯 <b>Потолок: {best_name}</b>\n"
-            text += f"├ Лимитка на шорт: <code>{best_data['val']:.4f}</code>\n"
-            text += f"└ Осталось: <b>{best_data['diff']:.2f}%</b>\n\n"
-            
-            text += f"📉 <i>Цена летит в стену. Ставь лимитку на уровень выше.</i>"
+            if chart_file:
+                base_coin = sym.split('_')[0].replace('USDT', '')
+                
+                # Стоп ставим на 1.5% выше зоны плотности
+                stop_loss = zone['level'] * 1.015
+                tp1 = current_price * 0.97
+                
+                text = f"🚀 <b>{base_coin}</b>\n"
+                text += f"Pump: <b>{pump_change:.2f}%</b>\n"
+                text += f"{open_p:.4f} -> {current_price:.4f}\n\n"
+                
+                text += f"🧱 <b>ЗОНА ПЛОТНОСТИ (Конфлюенс):</b>\n"
+                text += f"├ TF: <b>{zone['tf']}</b>\n"
+                text += f"├ Сопротивление: <b>{zone['type']}</b>\n"
+                text += f"├ <b>Лимитка на шорт: {zone['level']:.4f}</b>\n"
+                text += f"└ Осталось: <b>{zone['diff']:.2f}%</b>\n\n"
+                
+                text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
+                text += f"🟢 <b>Тейк-профит:</b> <code>{tp1:.4f}</code>\n\n"
+                text += f"📉 <i>Цена летит в зону, где сходятся EMA и исторический максимум. Вероятность отскока высокая.</i>"
 
-            send_telegram_photo(chart_file, text)
-            os.remove(chart_file)
-            found += 1
-            time.sleep(1)
+                send_telegram_photo(chart_file, text)
+                os.remove(chart_file)
+                found += 1
+                time.sleep(1)
 
 if __name__ == "__main__":
     main()
