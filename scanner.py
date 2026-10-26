@@ -10,31 +10,12 @@ CHAT_ID = os.environ.get("CHAT_ID")
 
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-# --- Отправка фото (без кнопок) ---
 def send_telegram_photo(photo_path, caption):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     try:
         with open(photo_path, 'rb') as photo:
-            payload = {
-                'chat_id': CHAT_ID, 
-                'caption': caption, 
-                'parse_mode': 'HTML'
-            }
-            requests.post(url, files={'photo': photo}, data=payload, headers=HEADERS, timeout=15)
+            requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
-
-# --- Поиск уровня "Откуда был слив" (Order Block) ---
-def find_dump_level(df):
-    try:
-        # Ищем последнюю сильную красную свечу за последние 30 свечей
-        for i in range(len(df)-2, len(df)-30, -1):
-            candle = df.iloc[i]
-            body = candle['open'] - candle['close']
-            # Если это сильная красная свеча (тело больше половины диапазона)
-            if candle['close'] < candle['open'] and body > (candle['high'] - candle['low']) * 0.5:
-                return candle['high'] 
-        return None
-    except: return None
 
 # --- Проверка глобального тренда (1D) ---
 def check_daily_trend(sym, exchange):
@@ -50,7 +31,7 @@ def check_daily_trend(sym, exchange):
         return df['close'].iloc[-1] < ema50 
     except: return True
 
-# --- Поиск EMA (стен) ---
+# --- Поиск EMA (строго сверху и не дальше 3%) ---
 def get_target_emas(sym, exchange, current_price):
     emas = {}
     timeframes = {"MEXC": ["Min60", "Hour4", "Day1", "Week1", "Month1"], "Bitget": ["1H", "4H", "1D", "1week", "1M"]}
@@ -71,31 +52,25 @@ def get_target_emas(sym, exchange, current_price):
             for span in [7, 14, 28, 50]:
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+                    # Берем ТОЛЬКО EMA, которые ВЫШЕ цены
                     if val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 3.0:
+                        if diff_pct <= 3.0: # Не дальше 3% (чтобы был быстрый вход)
                             emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
             time.sleep(0.1)
         except: pass
     return emas
 
-def draw_chart(sym, df_15m, target_val, target_name, dump_level):
+def draw_chart(sym, df_15m, target_val, target_name):
     try:
         filename = f"{sym}_chart.png"
         df = df_15m.copy()
         df.set_index('time', inplace=True)
         
-        lines = [target_val]
-        colors = ['red']
+        # Красная линия - потолок
+        hlines = dict(hlines=[target_val], colors=['red'], linestyle='-', linewidths=2.0)
         
-        # Если нашли уровень слива, добавляем его как фиолетовую линию
-        if dump_level:
-            lines.append(dump_level)
-            colors.append('purple')
-        
-        hlines = dict(hlines=lines, colors=colors, linestyle='-', linewidths=[2.0, 1.5])
-        
-        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m", tight_layout=True, hlines=hlines)
+        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | {target_name}", tight_layout=True, hlines=hlines)
         return filename
     except: return None
 
@@ -157,33 +132,22 @@ def main():
         df_15m = get_15m_data(sym, ex)
         if df_15m is None or len(df_15m) < 30: continue
         
-        # 1. Ищем сильный памп (от 5%)
+        # 1. Ищем памп (от 5%)
         open_p = df_15m['open'].iloc[-1]
         pump_change = ((current_price - open_p) / open_p) * 100
         if pump_change < 5.0: continue
 
-        # 2. Проверяем глобальный тренд
+        # 2. Тренд
         if not check_daily_trend(sym, ex): continue
 
-        # 3. Ищем уровень слива и EMA
-        dump_level = find_dump_level(df_15m)
+        # 3. Ищем потолок СТРОГО СВЕРХУ (макс 3% расстояния)
         target_emas = get_target_emas(sym, ex, current_price)
+        if not target_emas: continue # Если нет потолка, пропускаем (никаких старых зон снизу!)
         
-        if not target_emas and not dump_level: continue
-        
-        best_name, best_val, best_diff = "", 0, 999
-        
-        if target_emas:
-            best_ema = min(target_emas.items(), key=lambda x: x[1]['diff'])
-            best_name = best_ema[0]
-            best_val = best_ema[1]['val']
-            best_diff = best_ema[1]['diff']
-        elif dump_level and dump_level > current_price:
-            best_name = "Зона слива (Order Block)"
-            best_val = dump_level
-            best_diff = ((dump_level - current_price) / current_price) * 100
+        # Берем самую близкую EMA
+        best_name, best_data = min(target_emas.items(), key=lambda x: x[1]['diff'])
 
-        chart_file = draw_chart(sym, df_15m, best_val, best_name, dump_level)
+        chart_file = draw_chart(sym, df_15m, best_data['val'], best_name)
         
         if chart_file:
             base_coin = sym.split('_')[0].replace('USDT', '')
@@ -192,15 +156,11 @@ def main():
             text += f"Pump: <b>{pump_change:.2f}%</b>\n"
             text += f"{open_p:.4f} -> {current_price:.4f}\n\n"
             
-            if best_name:
-                text += f"🎯 <b>Сопротивление: {best_name}</b>\n"
-                text += f"├ Уровень: <code>{best_val:.4f}</code>\n"
-                text += f"└ Осталось: <b>{best_diff:.2f}%</b>\n\n"
+            text += f"🎯 <b>Потолок: {best_name}</b>\n"
+            text += f"├ Лимитка на шорт: <code>{best_data['val']:.4f}</code>\n"
+            text += f"└ Осталось: <b>{best_data['diff']:.2f}%</b>\n\n"
             
-            if dump_level:
-                text += f"🧱 <b>Уровень слива (Order Block):</b> <code>{dump_level:.4f}</code>\n\n"
-            
-            text += f"📉 <i>Думаю получим откат с текущих от уровня, откуда ранее слив рисовали.</i>"
+            text += f"📉 <i>Цена летит в стену. Ставь лимитку на уровень выше.</i>"
 
             send_telegram_photo(chart_file, text)
             os.remove(chart_file)
