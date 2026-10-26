@@ -22,115 +22,88 @@ def send_telegram_text(text):
     try: requests.post(url, data={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=10)
     except Exception as e: print(f"TG text error: {e}")
 
-# --- 1. Получаем EMA с 1H, 4H, 1D ---
+# --- Проверка глобального тренда (1D) ---
+def check_daily_trend(sym, exchange):
+    try:
+        if exchange == 'MEXC':
+            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Day1", headers=HEADERS, timeout=5).json()
+            if res.get('success'): df = pd.DataFrame({'close': [float(c) for c in res['data']['close']]})
+        elif exchange == 'Bitget':
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=1D&limit=100", headers=HEADERS, timeout=5).json()
+            if res.get('code') == '00000': df = pd.DataFrame({'close': [float(c[4]) for c in res['data']][::-1]})
+        if len(df) < 50: return True 
+        ema50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+        return df['close'].iloc[-1] < ema50 
+    except: return True
+
+# --- Поиск потолка (EMA) ---
 def get_target_emas(sym, exchange, current_price):
     emas = {}
     timeframes = {"MEXC": ["Min60", "Hour4", "Day1"], "Bitget": ["1H", "4H", "1D"]}
     for tf in timeframes[exchange]:
         try:
             if exchange == 'MEXC':
-                res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={tf}", headers=HEADERS, timeout=5).json()
+                res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={tf}", headers=HEADERS, timeout=3).json()
                 if res.get('success') and 'close' in res['data']: df = pd.DataFrame({'close': res['data']['close']})
                 else: continue
             elif exchange == 'Bitget':
-                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=100", headers=HEADERS, timeout=5).json()
+                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=100", headers=HEADERS, timeout=3).json()
                 if res.get('code') == '00000' and res.get('data'):
                     df = pd.DataFrame(res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
                     df['close'] = df['close'].astype(float)
                 else: continue
-            
             tf_name = tf.replace('Min', '').replace('Hour', 'H').replace('Day', 'D')
-            for span in [7, 14, 28]:
+            for span in [7, 14, 28, 50]:
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+                    # Ищем EMA, которая находится ПРЯМО НАД ценой (от 0% до 2% сверху)
                     if val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
-                        emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
+                        if diff_pct <= 2.0: # Потолок близко!
+                            emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
             time.sleep(0.1)
         except: pass
     return emas
 
-# --- 2. Расчет торгового плана (SL, TP, R:R) ---
-def calculate_trade_plan(df_15m, entry_price):
+# --- Расчет плана ---
+def calculate_trade_plan(entry_price, current_price):
     try:
-        # Стоп-лосс: максимум за последние 10 свечей + 1.5% буфер
-        recent_high = df_15m['high'].iloc[-10:].max()
-        stop_loss = max(recent_high, entry_price) * 1.015 
+        # Стоп ставим на 1.5% выше потолка
+        stop_loss = entry_price * 1.015 
         risk_pct = ((stop_loss - entry_price) / entry_price) * 100
-
-        # Тейк-профит 1: минимум за последние 20 свечей
-        tp1 = df_15m['low'].iloc[-20:].min()
-        # Тейк-профит 2: абсолютный минимум за последние 50 свечей
-        tp2 = df_15m['low'].iloc[-50:].min()
-
-        # Защита от некорректных данных
-        if tp1 >= entry_price: tp1 = entry_price * 0.96
-        if tp2 >= tp1: tp2 = tp1 * 0.95
-
+        
+        # Тейк: цель - 3% и 6% от точки входа
+        tp1 = entry_price * 0.97
+        tp2 = entry_price * 0.94
+        
         reward1_pct = ((entry_price - tp1) / entry_price) * 100
-        reward2_pct = ((entry_price - tp2) / entry_price) * 100
-
         rr_ratio = reward1_pct / risk_pct if risk_pct > 0 else 0
 
-        return {
-            'sl': stop_loss, 'risk': risk_pct,
-            'tp1': tp1, 'reward1': reward1_pct,
-            'tp2': tp2, 'reward2': reward2_pct,
-            'rr': rr_ratio
-        }
+        return {'sl': stop_loss, 'risk': risk_pct, 'tp1': tp1, 'tp2': tp2, 'rr': rr_ratio}
     except: return None
 
-# --- 3. SMC Анализ (Объем и Свип) ---
-def analyze_smc(df):
-    if df is None or len(df) < 20: return None
-    
-    current_vol = df['volume'].iloc[-1]
-    avg_vol = df['volume'].iloc[-20:-1].mean()
-    vol_spike = current_vol / avg_vol if avg_vol > 0 else 0
-
-    recent_high = df['high'].iloc[-20:-1].max()
-    current_high = df['high'].iloc[-1]
-    current_close = df['close'].iloc[-1]
-    
-    is_sweep = False
-    sweep_level = 0
-    if current_high > recent_high and current_close < recent_high:
-        is_sweep = True
-        sweep_level = recent_high
-
-    return {'vol_spike': vol_spike, 'is_sweep': is_sweep, 'sweep_level': sweep_level}
-
-# --- 4. Рисование графика ---
-def draw_chart(sym, df_15m, target_ema_val, target_name, smc_data):
+def draw_chart(sym, df_15m, target_ema_val, target_name):
     try:
         filename = f"{sym}_chart.png"
         df = df_15m.copy()
         df.set_index('time', inplace=True)
         
-        lines = [target_ema_val]
-        colors = ['green']
-        widths = [2.0]
+        # Красная линия - наш потолок (куда ставим лимитку)
+        hlines = dict(hlines=[target_ema_val], colors=['red'], linestyle='-', linewidths=2.0)
         
-        if smc_data['is_sweep']:
-            lines.append(smc_data['sweep_level'])
-            colors.append('yellow')
-            widths.append(1.5)
-
-        hlines = dict(hlines=lines, colors=colors, linestyle='-', linewidths=widths)
-        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | Target: {target_name}", tight_layout=True, hlines=hlines)
+        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | Ceiling: {target_name}", tight_layout=True, hlines=hlines)
         return filename
     except: return None
 
-# --- 5. Получение данных 15м ---
 def get_15m_data(sym, exchange):
     try:
         if exchange == 'MEXC':
-            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=5).json()
+            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=3).json()
             if res.get('success'):
                 data = res['data']
                 return pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close'], 'volume': data['vol']})
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=5).json()
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=3).json()
             if res.get('code') == '00000':
                 data = res['data']
                 df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -141,7 +114,6 @@ def get_15m_data(sym, exchange):
     except: pass
     return None
 
-# --- 6. Сбор ликвидных и волатильных монет ---
 def get_all_coins():
     coins = []
     try:
@@ -150,9 +122,8 @@ def get_all_coins():
             for c in res['data']:
                 vol, high, low = float(c.get('amount24', 0)), float(c.get('high24h', 0)), float(c.get('low24h', 0))
                 if c['symbol'].endswith('_USDT') and vol > 5000000 and low > 0:
-                    volat = ((high - low) / low) * 100
-                    if volat > 5.0:
-                        coins.append({'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice']), 'volat': volat})
+                    if ((high - low) / low) * 100 > 5.0:
+                        coins.append({'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice'])})
     except: pass
     try:
         res = requests.get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES", headers=HEADERS, timeout=10).json()
@@ -160,13 +131,9 @@ def get_all_coins():
             for c in res['data']:
                 vol, high, low = float(c.get('usdtVolume', 0)), float(c.get('high24h', 0)), float(c.get('low24h', 0))
                 if vol > 5000000 and low > 0:
-                    volat = ((high - low) / low) * 100
-                    if volat > 5.0:
-                        coins.append({'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr']), 'volat': volat})
+                    if ((high - low) / low) * 100 > 5.0:
+                        coins.append({'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr'])})
     except: pass
-    
-    # Сортируем по волатильности (сначала самые активные)
-    coins.sort(key=lambda x: x['volat'], reverse=True)
     return coins
 
 def main():
@@ -179,71 +146,60 @@ def main():
     found = 0
     for coin in list(unique_coins):
         if found >= 3: break
-        if time.time() - start_time > 240: break # Лимит 4 минуты
+        if time.time() - start_time > 240: break
             
-        sym, ex, current_price, volat = coin['sym'], coin['ex'], coin['price'], coin['volat']
+        sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
         
         df_15m = get_15m_data(sym, ex)
         if df_15m is None or len(df_15m) < 2: continue
         
-        # Проверка на быстрый памп (от 1.5% за 15 мин)
+        # 1. Проверяем, что идет рост (свеча зеленая и растет)
         open_p = df_15m['open'].iloc[-1]
-        pump_change = ((current_price - open_p) / open_p) * 100
+        close_p = df_15m['close'].iloc[-1]
+        pump_change = ((close_p - open_p) / open_p) * 100
+        
+        # Нам нужен активный рост от 1.5%
         if pump_change < 1.5: continue
 
-        smc = analyze_smc(df_15m)
-        if not smc: continue
+        # 2. Проверяем, что глобальный тренд не бычий
+        if not check_daily_trend(sym, ex): continue
 
+        # 3. Ищем "Потолок" (EMA) прямо над ценой (в пределах 2%)
         target_emas = get_target_emas(sym, ex, current_price)
         if not target_emas: continue
-
-        best_name, best_data = min(target_emas.items(), key=lambda x: x[1]['diff'])
         
-        plan = calculate_trade_plan(df_15m, best_data['val'])
+        # Берем самый близкий потолок
+        best_name, best_data = min(target_emas.items(), key=lambda x: x[1]['diff'])
+
+        # 4. Рассчитываем план
+        plan = calculate_trade_plan(best_data['val'], current_price)
         if not plan: continue
 
-        chart_file = draw_chart(sym, df_15m, best_data['val'], best_name, smc)
+        chart_file = draw_chart(sym, df_15m, best_data['val'], best_name)
         if chart_file:
-            text = f"🚨 <b>АНОМАЛИЯ + SMC</b>\n"
+            text = f"🧱 <b>ЦЕНА ЛЕТИТ В ПОТОЛОК</b>\n"
             text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym}</b>\n"
-            text += f"💰 Цена: <code>{current_price}</code> | Волатильность: <b>{volat:.1f}%</b>\n\n"
+            text += f"💰 Цена: <code>{current_price}</code> | Памп: <b>+{pump_change:.2f}%</b>\n\n"
             
-            if smc['vol_spike'] > 2.5:
-                text += f"📊 Объем: 🔥 Аномалия (x{smc['vol_spike']:.1f})\n"
-            if smc['is_sweep']:
-                text += f"⚠️ Ловушка (Sweep): Прокол <code>{smc['sweep_level']:.4f}</code>\n"
-            if smc['vol_spike'] < 2.5 and not smc['is_sweep']:
-                text += f"📉 Слабых сигналов SMC нет.\n"
+            text += f"🎯 <b>Потолок (Сопротивление):</b>\n"
+            text += f"├ Уровень: <b>{best_name}</b>\n"
+            text += f"├ Лимитка на шорт: <code>{best_data['val']:.4f}</code>\n"
+            text += f"└ Осталось лететь: <b><code>{best_data['diff']:.2f}%</code></b>\n\n"
             
-            text += f"\n🎯 <b>Цель: {best_name}</b>\n"
-            text += f"├ Лимитка (Вход): <code>{best_data['val']:.4f}</code>\n"
-            text += f"└ Осталось: <b><code>{best_data['diff']:.2f}%</code></b>\n\n"
-            
-            text += f"🛡 <b>Торговый план:</b>\n"
-            text += f"├ 🔴 Стоп: <code>{plan['sl']:.4f}</code> (-{plan['risk']:.1f}%)\n"
-            text += f"├ 🟢 Тейк 1: <code>{plan['tp1']:.4f}</code> (+{plan['reward1']:.1f}%)\n"
-            text += f"└ 🟢 Тейк 2: <code>{plan['tp2']:.4f}</code> (+{plan['reward2']:.1f}%)\n\n"
-            
-            text += f"⚖️ R:R = <b>1:{plan['rr']:.1f}</b>\n"
-            
-            if plan['rr'] >= 1.5:
-                text += f"🔥 <b>ОТЛИЧНАЯ СДЕЛКА!</b> Прибыль превышает риск."
-            elif plan['rr'] >= 1.0:
-                text += f"✅ <b>СДЕЛКА СРЕДНЯЯ.</b> Можно входить малым объемом."
-            else:
-                text += f"⚠️ <b>ПЛОХАЯ СДЕЛКА.</b> Риск больше прибыли. ПРОПУСТИТЬ."
+            text += f"🛡 <b>План:</b> SL: <code>{plan['sl']:.4f}</code> (+{plan['risk']:.1f}%)\n"
+            text += f"├ 🟢 TP1: <code>{plan['tp1']:.4f}</code>\n"
+            text += f"└ 🟢 TP2: <code>{plan['tp2']:.4f}</code>\n"
+            text += f"⚖️ R:R = <b>1:{plan['rr']:.1f}</b>\n\n"
 
-            if best_data['diff'] < 2.0 and not (smc['is_sweep'] or smc['vol_spike'] > 2.0):
-                text += f"\n\n⚠️ <i>Цена у цели, но НЕТ SMC (объема/свипа). ЖДИ ПОДТВЕРЖДЕНИЯ!</i>"
+            if plan['rr'] >= 1.5:
+                text += f"🔥 <b>ОТЛИЧНАЯ СДЕЛКА!</b> Цена ударится в потолок и отскочит."
+            else:
+                text += f"⚠️ <b>ОСТОРОЖНО.</b> Слишком высокий риск."
 
             send_telegram_photo(chart_file, text)
             os.remove(chart_file)
             found += 1
             time.sleep(1)
-
-    if found == 0:
-        print("Нет сигналов.")
-        # send_telegram_text("🤖 Сканер завершил работу. Сигналов нет.")
 
 if __name__ == "__main__":
     main()
