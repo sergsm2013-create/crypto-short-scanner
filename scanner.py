@@ -17,10 +17,14 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-def get_htf_emas(sym, exchange, current_price, direction):
-    emas = {}
-    timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D"), ("Week1", "1W"), ("Month1", "1M")], 
-                  "Bitget": [("4H", "4H"), ("1D", "1D"), ("1week", "1W"), ("1M", "1M")]}
+def get_htf_walls(sym, exchange, current_price):
+    """Ищем ВСЕ Недельные и Месячные EMA, которые находятся ВЫШЕ текущей цены"""
+    walls = []
+    timeframes = {
+        "MEXC": [("Week1", "1W"), ("Month1", "1M")], 
+        "Bitget": [("1week", "1W"), ("1M", "1M")]
+    }
+    
     for tf, tf_name in timeframes[exchange]:
         try:
             if exchange == 'MEXC':
@@ -34,26 +38,43 @@ def get_htf_emas(sym, exchange, current_price, direction):
                     df['close'] = df['close'].astype(float)
                 else: continue
 
-            for span in [7, 14, 28, 50, 100, 200]:
+            for span in [7, 14, 28, 50]:
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
-                    if direction == 'SHORT' and val > current_price:
+                    
+                    # Берем ТОЛЬКО те EMA, которые ВЫШЕ текущей цены
+                    if val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
-                    elif direction == 'LONG' and val < current_price:
-                        diff_pct = ((current_price - val) / current_price) * 100
-                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
+                        walls.append({
+                            'name': f"{tf_name} EMA {span}",
+                            'val': val,
+                            'diff': diff_pct
+                        })
             time.sleep(0.1)
         except: pass
-    return emas
+    
+    # Сортируем стены от ближайшей к самой дальней
+    walls.sort(key=lambda x: x['diff'])
+    return walls
 
-# --- ФУНКЦИЯ ПРОВЕРКИ RSI (Перекупленность/Перепроданность) ---
-def calculate_rsi(df, period=14):
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs)).iloc[-1]
+def draw_chart(sym, df_15m, walls):
+    try:
+        filename = f"{sym}_pump.png"
+        df = df_15m.copy()
+        df.set_index('time', inplace=True)
+        
+        # Рисуем линии для всех найденных стен
+        lines = [w['val'] for w in walls]
+        colors = ['red', 'orange', 'purple', 'blue'] # Разные цвета для разных EMA
+        widths = [2.0, 1.5, 1.5, 1.0]
+        
+        hlines = dict(hlines=lines, colors=colors[:len(lines)], linestyle='-', linewidths=widths[:len(lines)])
+        
+        mpf.plot(df.tail(40), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | SNIPER TARGETS (1W/1M)", tight_layout=True, hlines=hlines)
+        return filename
+    except Exception as e: 
+        print(f"Chart error: {e}")
+        return None
 
 def get_15m_data(sym, exchange):
     try:
@@ -109,82 +130,36 @@ def main():
         df_15m = get_15m_data(sym, ex)
         if df_15m is None or len(df_15m) < 30: continue
         
+        # 🔥 ЛОВИМ ПАМП: Рост от 4% за 15 минут (параболическое движение)
         open_p = df_15m['open'].iloc[-1]
         change_pct = ((current_price - open_p) / open_p) * 100
         
-        # 🛑 ЖЕСТКИЙ ФИЛЬТР ДЛЯ ЛОНГОВ: Ловим только небольшие коррекции (от -1.5% до -3%)
-        if -3.0 <= change_pct <= -1.5:
-            direction = 'LONG'
-        # 🔥 ДЛЯ ШОРТОВ: Ловим любой памп от +2%
-        elif change_pct >= 2.0:
-            direction = 'SHORT'
-        else:
-            continue # Всё остальное (например, падение на -7%) игнорируем!
+        if change_pct < 4.0: continue # Если нет сильного пампа, пропускаем
 
-        rsi = calculate_rsi(df_15m)
-        
-        # Если это памп для шорта, проверим, не перегрет ли рынок
-        if direction == 'SHORT' and rsi > 82:
-            # Это параболический памп! Даем сигнал по рынку (или лимитку на пик свечи)
-            filename = f"{sym}_peak.png"
-            df = df_15m.copy()
-            df.set_index('time', inplace=True)
-            # Линия на пике последней зеленой свечи
-            peak_price = df['high'].iloc[-1] 
-            hlines = dict(hlines=[peak_price], colors=['red'], linestyle='--', linewidths=2.0)
-            mpf.plot(df.tail(30), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | PEAK EXHAUSTION", tight_layout=True, hlines=hlines)
-            
-            text = f"🔥 <b>КУЛЬМИНАЦИЯ ПАМПА (ШОРТ)</b>\n"
-            text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym.split('_')[0]}</b>\n"
-            text += f"📊 Памп: <b>{change_pct:+.2f}%</b> | RSI: <b>{rsi:.1f}</b> (Перегрев!)\n\n"
-            text += f"🎯 <b>Лимитка на пике:</b> <code>{peak_price:.4f}</code>\n"
-            text += f"<i>(Или шорт по рынку, если появилась красная свеча)</i>\n\n"
-            text += f"🛑 <b>Стоп:</b> <code>{peak_price * 1.02:.4f}</code> (Выше пика)"
-            
-            send_telegram_photo(filename, text)
-            os.remove(filename)
-            found += 1
-            time.sleep(1)
-            continue
+        # Ищем Недельные и Месячные стены над ценой
+        walls = get_htf_walls(sym, ex, current_price)
+        if not walls: continue # Если цена выше всех EMA (космос), пропускаем
 
-        # Ищем стену для стандартного входа
-        wall = get_htf_emas(sym, ex, current_price, direction)
-        if not wall: continue
-        
-        best_wall_name, best_wall_data = min(wall.items(), key=lambda x: x[1]['diff'])
+        # Берем первую (самую близкую) и вторую стену
+        wall1 = walls[0]
+        wall2 = walls[1] if len(walls) > 1 else None
 
-        chart_file = f"{sym}_chart.png"
-        df = df_15m.copy()
-        df.set_index('time', inplace=True)
-        color = 'red' if direction == 'SHORT' else 'green'
-        hlines = dict(hlines=[best_wall_data['val']], colors=[color], linestyle='-', linewidths=2.0)
-        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=chart_file, title=f"{sym} 15m | {direction} {best_wall_name}", tight_layout=True, hlines=hlines)
+        chart_file = draw_chart(sym, df_15m, walls)
         
         if chart_file:
             base_coin = sym.split('_')[0].replace('USDT', '')
             
-            if direction == 'SHORT':
-                stop_loss = best_wall_data['val'] * 1.015
-                tp = best_wall_data['val'] * 0.95
-                emoji = "🔴"
-                action = "ШОРТ"
-            else:
-                stop_loss = best_wall_data['val'] * 0.985
-                tp = best_wall_data['val'] * 1.05
-                emoji = "🟢"
-                action = "ЛОНГ"
-
-            text = f"{emoji} <b>СИГНАЛ: {action} (Старший ТФ)</b>\n"
+            text = f"🚀 <b>ПАМП +{change_pct:.2f}% (Ловим Пик!)</b>\n"
             text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
-            text += f"📊 Изм. 15м: <b>{change_pct:+.2f}%</b> | RSI: <b>{rsi:.1f}</b>\n"
             text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
             
-            text += f"🧱 <b>Стена:</b> {best_wall_name}\n"
-            text += f"├ <b>Лимитка: {best_wall_data['val']:.4f}</b>\n"
-            text += f"└ Осталось: <b>{best_wall_data['diff']:.2f}%</b>\n\n"
+            text += f"🧱 <b>Твои цели на ШОРТ (1W/1M):</b>\n"
+            text += f"├ Ближайшая: <b>{wall1['name']}</b> на <code>{wall1['val']:.4f}</code> (+{wall1['diff']:.1f}%)\n"
+            if wall2:
+                text += f"└ Следующая: <b>{wall2['name']}</b> на <code>{wall2['val']:.4f}</code> (+{wall2['diff']:.1f}%)\n\n"
             
-            text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
-            text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
+            text += f"🛑 <b>Стоп-лосс:</b> ставь на 2-3% выше выбранной EMA.\n"
+            text += f"⚡️ <i>Ставь лимитку ровно на уровень стены. Когда цена долетит и ударится — она рухнет.</i>"
 
             send_telegram_photo(chart_file, text)
             os.remove(chart_file)
