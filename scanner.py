@@ -17,74 +17,38 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-# --- ПОИСК EMA НА 4H, 1D, 1W, 1M ---
-def get_htf_emas(sym, exchange, current_price, direction):
-    emas = {}
-    timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D"), ("Week1", "1W"), ("Month1", "1M")], 
-                  "Bitget": [("4H", "4H"), ("1D", "1D"), ("1week", "1W"), ("1M", "1M")]}
-    for tf, tf_name in timeframes[exchange]:
-        try:
-            if exchange == 'MEXC':
-                res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={tf}", headers=HEADERS, timeout=5).json()
-                if res.get('success') and 'close' in res['data']: df = pd.DataFrame({'close': res['data']['close']})
-                else: continue
-            elif exchange == 'Bitget':
-                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=200", headers=HEADERS, timeout=5).json()
-                if res.get('code') == '00000' and res.get('data'):
-                    df = pd.DataFrame(res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-                    df['close'] = df['close'].astype(float)
-                else: continue
-
-            for span in [7, 14, 28, 50, 100, 200]:
-                if len(df) >= span:
-                    val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
-                    if direction == 'SHORT' and val > current_price:
-                        diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
-                    elif direction == 'LONG' and val < current_price:
-                        diff_pct = ((current_price - val) / current_price) * 100
-                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
-            time.sleep(0.1)
-        except: pass
-    return emas
-
-# --- РАСЧЕТ RSI ---
-def calculate_rsi(df, period=14):
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-9) # Защита от деления на ноль
-    return 100 - (100 / (1 + rs)).iloc[-1]
-
-def draw_chart(sym, df_15m, target_val, target_name, direction):
-    try:
-        filename = f"{sym}_chart.png"
-        df = df_15m.copy()
-        df.set_index('time', inplace=True)
-        color = 'red' if direction == 'SHORT' else 'green'
-        hlines = dict(hlines=[target_val], colors=[color], linestyle='-', linewidths=2.0)
-        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | {direction} {target_name}", tight_layout=True, hlines=hlines)
-        return filename
-    except: return None
-
-def get_15m_data(sym, exchange):
+# --- Считаем EMA и RSI на 1H графике ---
+def get_1h_indicators(sym, exchange):
     try:
         if exchange == 'MEXC':
-            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=3).json()
-            if res.get('success'):
-                data = res['data']
-                return pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close'], 'volume': data['vol']})
+            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min60", headers=HEADERS, timeout=5).json()
+            if not res.get('success'): return None
+            data = res['data']
+            df = pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close']})
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=3).json()
-            if res.get('code') == '00000':
-                data = res['data']
-                df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-                df = df.iloc[::-1]
-                df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms')
-                for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = df[col].astype(float)
-                return df
-    except: pass
-    return None
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=1H&limit=100", headers=HEADERS, timeout=5).json()
+            if res.get('code') != '00000': return None
+            data = res['data']
+            df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+            df = df.iloc[::-1]
+            df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms')
+            for col in ['open', 'high', 'low', 'close']: df[col] = df[col].astype(float)
+
+        if len(df) < 50: return None
+        
+        # Считаем EMA 7 и 14
+        df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
+        df['ema14'] = df['close'].ewm(span=14, adjust=False).mean()
+        
+        # Считаем RSI (14)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / (loss + 1e-9)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        return df.dropna()
+    except: return None
 
 def get_all_coins():
     coins = []
@@ -118,55 +82,49 @@ def main():
             
         sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
         
-        df_15m = get_15m_data(sym, ex)
-        if df_15m is None or len(df_15m) < 30: continue
+        df = get_1h_indicators(sym, ex)
+        if df is None or len(df) < 2: continue
         
-        open_p = df_15m['open'].iloc[-1]
-        change_pct = ((current_price - open_p) / open_p) * 100
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
         
-        direction = None
-        if change_pct >= 2.0: direction = 'SHORT'
-        elif -3.0 <= change_pct <= -1.5: direction = 'LONG'
+        # 1. Вычисляем отклонение от EMA 7
+        deviation_pct = ((last['close'] - last['ema7']) / last['ema7']) * 100
         
-        if not direction: continue
-
-        rsi = calculate_rsi(df_15m)
+        # 2. Условия для "Параболического истощения"
+        is_overextended = deviation_pct > 15.0  # Цена выше EMA 7 на 15%+ (как на QUSDT)
+        is_overbought = last['rsi'] > 80.0      # RSI в зоне экстремального перегрева
+        is_red_candle = last['close'] < last['open'] # Текущая свеча красная (отторжение)
         
-        wall = get_htf_emas(sym, ex, current_price, direction)
-        if not wall: continue
-        
-        best_wall_name, best_wall_data = min(wall.items(), key=lambda x: x[1]['diff'])
-
-        chart_file = draw_chart(sym, df_15m, best_wall_data['val'], best_wall_name, direction)
-        
-        if chart_file:
+        # Если совпали все условия
+        if is_overextended and is_overbought and is_red_candle:
+            
+            # Рисуем график 1H
+            filename = f"{sym}_peak.png"
+            df_plot = df.copy()
+            df_plot.set_index('time', inplace=True)
+            
+            # Линия стопа на максимуме свечи
+            peak_high = prev['high']
+            hlines = dict(hlines=[peak_high], colors=['red'], linestyle='--', linewidths=2.0)
+            mpf.plot(df_plot.tail(30), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 1H | PARABOLIC EXHAUSTION", tight_layout=True, hlines=hlines)
+            
             base_coin = sym.split('_')[0].replace('USDT', '')
             
-            if direction == 'SHORT':
-                stop_loss = best_wall_data['val'] * 1.015
-                tp = best_wall_data['val'] * 0.95
-                emoji = "🔴"
-                action = "ШОРТ"
-            else:
-                stop_loss = best_wall_data['val'] * 0.985
-                tp = best_wall_data['val'] * 1.05
-                emoji = "🟢"
-                action = "ЛОНГ"
-
-            text = f"{emoji} <b>СИГНАЛ: {action} (Старший ТФ)</b>\n"
+            text = f"🔥 <b>ПАРАБОЛИЧЕСКИЙ ПАМП (ШОРТ)</b>\n"
             text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
-            text += f"📊 Изм. 15м: <b>{change_pct:+.2f}%</b> | RSI: <b>{rsi:.1f}</b>\n"
             text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
+            text += f"📊 <b>Аномалия 1H:</b>\n"
+            text += f"├ Отклонение от EMA 7: <b>+{deviation_pct:.1f}%</b> 🔥\n"
+            text += f"└ RSI: <b>{last['rsi']:.1f}</b> 🔥 (Экстремальный перегрев)\n\n"
             
-            text += f"🧱 <b>Стена:</b> {best_wall_name}\n"
-            text += f"├ <b>Лимитка: {best_wall_data['val']:.4f}</b>\n"
-            text += f"└ Осталось: <b>{best_wall_data['diff']:.2f}%</b>\n\n"
-            
-            text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
-            text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
+            text += f"🎯 <b>Вход:</b> По рынку (или лимитка на <code>{last['high']:.4f}</code>)\n"
+            text += f"🛑 <b>Стоп-лосс:</b> <code>{peak_high * 1.01:.4f}</code> (Выше пика)\n"
+            text += f"🟢 <b>Тейк-профит:</b> <code>{last['ema14']:.4f}</code> (Возврат к EMA 14)\n\n"
+            text += f"⚡️ <i>Цена оторвалась от средней. Ждем обвала!</i>"
 
-            send_telegram_photo(chart_file, text)
-            os.remove(chart_file)
+            send_telegram_photo(filename, text)
+            os.remove(filename)
             found += 1
             time.sleep(1)
 
