@@ -4,7 +4,6 @@ import pandas as pd
 import mplfinance as mpf
 import sys
 import time
-import math
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -18,37 +17,8 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-# --- БЕЗОПАСНЫЙ РАСЧЕТ ИНДИКАТОРОВ ---
-def calculate_indicators(df):
-    try:
-        # Bollinger Bands (20, 2)
-        df['ma20'] = df['close'].rolling(window=20).mean()
-        df['std'] = df['close'].rolling(window=20).std()
-        df['bb_upper'] = df['ma20'] + (df['std'] * 2)
-        
-        # RSI (14) - Защита от деления на ноль
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9) # Защита от ZeroDivisionError
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # MACD (12, 26, 9)
-        ema12 = df['close'].ewm(span=12, adjust=False).mean()
-        ema26 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = ema12 - ema26
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
-        
-        # Очистка от NaN (пустых значений), которые появляются в начале
-        df = df.dropna()
-        return df
-    except Exception as e:
-        print(f"Indicator error: {e}")
-        return None
-
-# --- ПОИСК СТЕН НА СТАРШИХ ТФ ---
-def get_htf_emas(sym, exchange, current_price):
+# --- ПОИСК EMA НА 4H, 1D, 1W, 1M ---
+def get_htf_emas(sym, exchange, current_price, direction):
     emas = {}
     timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D"), ("Week1", "1W"), ("Month1", "1M")], 
                   "Bitget": [("4H", "4H"), ("1D", "1D"), ("1week", "1W"), ("1M", "1M")]}
@@ -68,13 +38,34 @@ def get_htf_emas(sym, exchange, current_price):
             for span in [7, 14, 28, 50, 100, 200]:
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
-                    if val > current_price:
+                    if direction == 'SHORT' and val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 5.0:
-                            emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
+                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
+                    elif direction == 'LONG' and val < current_price:
+                        diff_pct = ((current_price - val) / current_price) * 100
+                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
             time.sleep(0.1)
         except: pass
     return emas
+
+# --- РАСЧЕТ RSI ---
+def calculate_rsi(df, period=14):
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-9) # Защита от деления на ноль
+    return 100 - (100 / (1 + rs)).iloc[-1]
+
+def draw_chart(sym, df_15m, target_val, target_name, direction):
+    try:
+        filename = f"{sym}_chart.png"
+        df = df_15m.copy()
+        df.set_index('time', inplace=True)
+        color = 'red' if direction == 'SHORT' else 'green'
+        hlines = dict(hlines=[target_val], colors=[color], linestyle='-', linewidths=2.0)
+        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | {direction} {target_name}", tight_layout=True, hlines=hlines)
+        return filename
+    except: return None
 
 def get_15m_data(sym, exchange):
     try:
@@ -84,7 +75,7 @@ def get_15m_data(sym, exchange):
                 data = res['data']
                 return pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close'], 'volume': data['vol']})
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=100", headers=HEADERS, timeout=3).json()
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=3).json()
             if res.get('code') == '00000':
                 data = res['data']
                 df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -127,72 +118,52 @@ def main():
             
         sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
         
-        df = get_15m_data(sym, ex)
-        # Проверка, что данных достаточно для MACD (нужно хотя бы 40 свечей)
-        if df is None or len(df) < 40: continue
+        df_15m = get_15m_data(sym, ex)
+        if df_15m is None or len(df_15m) < 30: continue
         
-        # 1. Считаем индикаторы
-        df = calculate_indicators(df)
-        if df is None or len(df) < 2: continue
-        
-        last = df.iloc[-1]
-        
-        # 2. Проверяем памп (рост от 3% за 15 минут)
-        open_p = last['open']
+        open_p = df_15m['open'].iloc[-1]
         change_pct = ((current_price - open_p) / open_p) * 100
-        if change_pct < 3.0: continue
         
-        # 3. ПРОВЕРКА ИНДИКАТОРОВ (Фильтр Шорта)
-        is_above_bb = current_price >= last['bb_upper']
-        is_overbought = last['rsi'] > 70
-        is_macd_positive = last['macd_hist'] > 0
+        direction = None
+        if change_pct >= 2.0: direction = 'SHORT'
+        elif -3.0 <= change_pct <= -1.5: direction = 'LONG'
         
-        # Требуем совпадения всех трех условий (перегрев + BB + MACD)
-        if not (is_above_bb and is_overbought and is_macd_positive):
-            continue 
+        if not direction: continue
 
-        # 4. Ищем стену (EMA старших ТФ)
-        wall = get_htf_emas(sym, ex, current_price)
+        rsi = calculate_rsi(df_15m)
+        
+        wall = get_htf_emas(sym, ex, current_price, direction)
         if not wall: continue
         
         best_wall_name, best_wall_data = min(wall.items(), key=lambda x: x[1]['diff'])
 
-        # 5. Рисуем график
-        chart_file = f"{sym}_chart.png"
-        df_plot = df.copy()
-        df_plot.set_index('time', inplace=True)
-        
-        apds = [
-            mpf.make_addplot(df_plot['bb_upper'], color='purple', width=1.5),
-            mpf.make_addplot(df_plot['ma20'], color='gray', width=1.0)
-        ]
-        
-        hlines = dict(hlines=[best_wall_data['val']], colors=['red'], linestyle='-', linewidths=2.0)
-        mpf.plot(df_plot.tail(30), type='candle', style='yahoo', volume=True, addplot=apds, savefig=chart_file, title=f"{sym} 15m | SHORT Setup", tight_layout=True, hlines=hlines)
+        chart_file = draw_chart(sym, df_15m, best_wall_data['val'], best_wall_name, direction)
         
         if chart_file:
             base_coin = sym.split('_')[0].replace('USDT', '')
             
-            stop_loss = best_wall_data['val'] * 1.015
-            tp = best_wall_data['val'] * 0.95
+            if direction == 'SHORT':
+                stop_loss = best_wall_data['val'] * 1.015
+                tp = best_wall_data['val'] * 0.95
+                emoji = "🔴"
+                action = "ШОРТ"
+            else:
+                stop_loss = best_wall_data['val'] * 0.985
+                tp = best_wall_data['val'] * 1.05
+                emoji = "🟢"
+                action = "ЛОНГ"
 
-            text = f"🔴 <b>СИГНАЛ: ШОРТ (Индикаторы + Стена)</b>\n"
+            text = f"{emoji} <b>СИГНАЛ: {action} (Старший ТФ)</b>\n"
             text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
-            text += f"📊 Памп: <b>{change_pct:+.2f}%</b>\n"
+            text += f"📊 Изм. 15м: <b>{change_pct:+.2f}%</b> | RSI: <b>{rsi:.1f}</b>\n"
             text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
             
-            text += f"📉 <b>Индикаторы (15м):</b>\n"
-            text += f"├ RSI: <b>{last['rsi']:.1f}</b> 🔥\n"
-            text += f"├ BB Upper: <b>{last['bb_upper']:.4f}</b> 🔥\n"
-            text += f"└ MACD: <b>{last['macd_hist']:.4f}</b>\n\n"
-            
-            text += f"🧱 <b>Стена (Цель):</b> {best_wall_name}\n"
+            text += f"🧱 <b>Стена:</b> {best_wall_name}\n"
             text += f"├ <b>Лимитка: {best_wall_data['val']:.4f}</b>\n"
             text += f"└ Осталось: <b>{best_wall_data['diff']:.2f}%</b>\n\n"
             
             text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
             text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
-            text += f"⚡️ <i>Перегрев + Стена = Идеальный шорт!</i>"
 
             send_telegram_photo(chart_file, text)
             os.remove(chart_file)
