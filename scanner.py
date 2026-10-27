@@ -4,6 +4,7 @@ import pandas as pd
 import mplfinance as mpf
 import sys
 import time
+import math
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -17,28 +18,34 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-# --- РАСЧЕТ ИНДИКАТОРОВ ---
+# --- БЕЗОПАСНЫЙ РАСЧЕТ ИНДИКАТОРОВ ---
 def calculate_indicators(df):
-    # Bollinger Bands (20, 2)
-    df['ma20'] = df['close'].rolling(window=20).mean()
-    df['std'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['ma20'] + (df['std'] * 2)
-    
-    # RSI (14)
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    # MACD (12, 26, 9)
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = ema12 - ema26
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
-    
-    return df
+    try:
+        # Bollinger Bands (20, 2)
+        df['ma20'] = df['close'].rolling(window=20).mean()
+        df['std'] = df['close'].rolling(window=20).std()
+        df['bb_upper'] = df['ma20'] + (df['std'] * 2)
+        
+        # RSI (14) - Защита от деления на ноль
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / (loss + 1e-9) # Защита от ZeroDivisionError
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # MACD (12, 26, 9)
+        ema12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = ema12 - ema26
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd'] - df['macd_signal']
+        
+        # Очистка от NaN (пустых значений), которые появляются в начале
+        df = df.dropna()
+        return df
+    except Exception as e:
+        print(f"Indicator error: {e}")
+        return None
 
 # --- ПОИСК СТЕН НА СТАРШИХ ТФ ---
 def get_htf_emas(sym, exchange, current_price):
@@ -61,10 +68,9 @@ def get_htf_emas(sym, exchange, current_price):
             for span in [7, 14, 28, 50, 100, 200]:
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
-                    # Нам нужны только стены СВЕРХУ (сопротивление для шорта)
                     if val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 5.0: # Не дальше 5%
+                        if diff_pct <= 5.0:
                             emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
             time.sleep(0.1)
         except: pass
@@ -78,7 +84,7 @@ def get_15m_data(sym, exchange):
                 data = res['data']
                 return pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close'], 'volume': data['vol']})
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=3).json()
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=100", headers=HEADERS, timeout=3).json()
             if res.get('code') == '00000':
                 data = res['data']
                 df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -122,10 +128,13 @@ def main():
         sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
         
         df = get_15m_data(sym, ex)
-        if df is None or len(df) < 30: continue
+        # Проверка, что данных достаточно для MACD (нужно хотя бы 40 свечей)
+        if df is None or len(df) < 40: continue
         
         # 1. Считаем индикаторы
         df = calculate_indicators(df)
+        if df is None or len(df) < 2: continue
+        
         last = df.iloc[-1]
         
         # 2. Проверяем памп (рост от 3% за 15 минут)
@@ -134,15 +143,12 @@ def main():
         if change_pct < 3.0: continue
         
         # 3. ПРОВЕРКА ИНДИКАТОРОВ (Фильтр Шорта)
-        # BB: Цена должна быть выше верхней полосы
         is_above_bb = current_price >= last['bb_upper']
-        # RSI: Должен быть выше 70 (перекупленность)
         is_overbought = last['rsi'] > 70
-        # MACD: Гистограмма положительная (импульс вверх), но начинает падать
-        is_macd_exhausting = last['macd_hist'] > 0 and last['macd_hist'] < df['macd_hist'].iloc[-2]
+        is_macd_positive = last['macd_hist'] > 0
         
-        # Если хотя бы 2 из 3 индикаторов подтверждают перегрев
-        if not (is_above_bb and is_overbought):
+        # Требуем совпадения всех трех условий (перегрев + BB + MACD)
+        if not (is_above_bb and is_overbought and is_macd_positive):
             continue 
 
         # 4. Ищем стену (EMA старших ТФ)
@@ -156,7 +162,6 @@ def main():
         df_plot = df.copy()
         df_plot.set_index('time', inplace=True)
         
-        # Добавляем на график линии Боллинджера и EMA
         apds = [
             mpf.make_addplot(df_plot['bb_upper'], color='purple', width=1.5),
             mpf.make_addplot(df_plot['ma20'], color='gray', width=1.0)
@@ -176,11 +181,10 @@ def main():
             text += f"📊 Памп: <b>{change_pct:+.2f}%</b>\n"
             text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
             
-            # Выводим данные индикаторов
             text += f"📉 <b>Индикаторы (15м):</b>\n"
-            text += f"├ RSI: <b>{last['rsi']:.1f}</b> {'🔥' if is_overbought else ''}\n"
-            text += f"├ BB Upper: <b>{last['bb_upper']:.4f}</b> {'🔥' if is_above_bb else ''}\n"
-            text += f"└ MACD Hist: <b>{last['macd_hist']:.4f}</b>\n\n"
+            text += f"├ RSI: <b>{last['rsi']:.1f}</b> 🔥\n"
+            text += f"├ BB Upper: <b>{last['bb_upper']:.4f}</b> 🔥\n"
+            text += f"└ MACD: <b>{last['macd_hist']:.4f}</b>\n\n"
             
             text += f"🧱 <b>Стена (Цель):</b> {best_wall_name}\n"
             text += f"├ <b>Лимитка: {best_wall_data['val']:.4f}</b>\n"
