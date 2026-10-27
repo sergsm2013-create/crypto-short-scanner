@@ -17,14 +17,34 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-def get_htf_ladder(sym, exchange, current_price):
-    """Ищем ВСЮ лестницу Недельных и Месячных EMA над ценой"""
-    walls = []
-    timeframes = {
-        "MEXC": [("Week1", "1W"), ("Month1", "1M")], 
-        "Bitget": [("1week", "1W"), ("1M", "1M")]
-    }
+# --- РАСЧЕТ ИНДИКАТОРОВ ---
+def calculate_indicators(df):
+    # Bollinger Bands (20, 2)
+    df['ma20'] = df['close'].rolling(window=20).mean()
+    df['std'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['ma20'] + (df['std'] * 2)
     
+    # RSI (14)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # MACD (12, 26, 9)
+    ema12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = ema12 - ema26
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+    
+    return df
+
+# --- ПОИСК СТЕН НА СТАРШИХ ТФ ---
+def get_htf_emas(sym, exchange, current_price):
+    emas = {}
+    timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D"), ("Week1", "1W"), ("Month1", "1M")], 
+                  "Bitget": [("4H", "4H"), ("1D", "1D"), ("1week", "1W"), ("1M", "1M")]}
     for tf, tf_name in timeframes[exchange]:
         try:
             if exchange == 'MEXC':
@@ -38,39 +58,17 @@ def get_htf_ladder(sym, exchange, current_price):
                     df['close'] = df['close'].astype(float)
                 else: continue
 
-            for span in [7, 14, 28, 50]:
+            for span in [7, 14, 28, 50, 100, 200]:
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
-                    
-                    # Собираем ВСЕ EMA, которые выше текущей цены
+                    # Нам нужны только стены СВЕРХУ (сопротивление для шорта)
                     if val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
-                        walls.append({
-                            'name': f"{tf_name} EMA {span}",
-                            'val': val,
-                            'diff': diff_pct
-                        })
+                        if diff_pct <= 5.0: # Не дальше 5%
+                            emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
             time.sleep(0.1)
         except: pass
-    
-    # Сортируем от ближайшей к самой дальней
-    walls.sort(key=lambda x: x['diff'])
-    return walls
-
-def draw_chart(sym, df_15m, walls):
-    try:
-        filename = f"{sym}_ladder.png"
-        df = df_15m.copy()
-        df.set_index('time', inplace=True)
-        
-        # Рисуем горизонтальные линии для первых 3-х целей
-        lines = [w['val'] for w in walls[:3]]
-        colors = ['red', 'orange', 'purple'] 
-        hlines = dict(hlines=lines, colors=colors[:len(lines)], linestyle='-', linewidths=[2.0, 1.5, 1.5])
-        
-        mpf.plot(df.tail(40), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | Sniper Ladder", tight_layout=True, hlines=hlines)
-        return filename
-    except Exception as e: return None
+    return emas
 
 def get_15m_data(sym, exchange):
     try:
@@ -123,35 +121,74 @@ def main():
             
         sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
         
-        df_15m = get_15m_data(sym, ex)
-        if df_15m is None or len(df_15m) < 30: continue
+        df = get_15m_data(sym, ex)
+        if df is None or len(df) < 30: continue
         
-        # 1. Ловим памп (от 4% за 15 минут)
-        open_p = df_15m['open'].iloc[-1]
+        # 1. Считаем индикаторы
+        df = calculate_indicators(df)
+        last = df.iloc[-1]
+        
+        # 2. Проверяем памп (рост от 3% за 15 минут)
+        open_p = last['open']
         change_pct = ((current_price - open_p) / open_p) * 100
+        if change_pct < 3.0: continue
         
-        if change_pct < 4.0: continue 
+        # 3. ПРОВЕРКА ИНДИКАТОРОВ (Фильтр Шорта)
+        # BB: Цена должна быть выше верхней полосы
+        is_above_bb = current_price >= last['bb_upper']
+        # RSI: Должен быть выше 70 (перекупленность)
+        is_overbought = last['rsi'] > 70
+        # MACD: Гистограмма положительная (импульс вверх), но начинает падать
+        is_macd_exhausting = last['macd_hist'] > 0 and last['macd_hist'] < df['macd_hist'].iloc[-2]
+        
+        # Если хотя бы 2 из 3 индикаторов подтверждают перегрев
+        if not (is_above_bb and is_overbought):
+            continue 
 
-        # 2. Ищем лестницу старших EMA
-        walls = get_htf_ladder(sym, ex, current_price)
-        if not walls: continue # Если цена уже выше всех EMA, пропускаем
+        # 4. Ищем стену (EMA старших ТФ)
+        wall = get_htf_emas(sym, ex, current_price)
+        if not wall: continue
+        
+        best_wall_name, best_wall_data = min(wall.items(), key=lambda x: x[1]['diff'])
 
-        chart_file = draw_chart(sym, df_15m, walls)
+        # 5. Рисуем график
+        chart_file = f"{sym}_chart.png"
+        df_plot = df.copy()
+        df_plot.set_index('time', inplace=True)
+        
+        # Добавляем на график линии Боллинджера и EMA
+        apds = [
+            mpf.make_addplot(df_plot['bb_upper'], color='purple', width=1.5),
+            mpf.make_addplot(df_plot['ma20'], color='gray', width=1.0)
+        ]
+        
+        hlines = dict(hlines=[best_wall_data['val']], colors=['red'], linestyle='-', linewidths=2.0)
+        mpf.plot(df_plot.tail(30), type='candle', style='yahoo', volume=True, addplot=apds, savefig=chart_file, title=f"{sym} 15m | SHORT Setup", tight_layout=True, hlines=hlines)
         
         if chart_file:
             base_coin = sym.split('_')[0].replace('USDT', '')
             
-            text = f"🚀 <b>ПАМП +{change_pct:.2f}% (Сетка целей)</b>\n"
+            stop_loss = best_wall_data['val'] * 1.015
+            tp = best_wall_data['val'] * 0.95
+
+            text = f"🔴 <b>СИГНАЛ: ШОРТ (Индикаторы + Стена)</b>\n"
             text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
+            text += f"📊 Памп: <b>{change_pct:+.2f}%</b>\n"
             text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
             
-            text += f"🎯 <b>Твоя лестница на ШОРТ:</b>\n"
+            # Выводим данные индикаторов
+            text += f"📉 <b>Индикаторы (15м):</b>\n"
+            text += f"├ RSI: <b>{last['rsi']:.1f}</b> {'🔥' if is_overbought else ''}\n"
+            text += f"├ BB Upper: <b>{last['bb_upper']:.4f}</b> {'🔥' if is_above_bb else ''}\n"
+            text += f"└ MACD Hist: <b>{last['macd_hist']:.4f}</b>\n\n"
             
-            # Выводим первые 3 цели (EMA 7, 14, 28)
-            for i, w in enumerate(walls[:3]):
-                text += f"├ <b>{w['name']}:</b> <code>{w['val']:.4f}</code> (+{w['diff']:.1f}%)\n"
+            text += f"🧱 <b>Стена (Цель):</b> {best_wall_name}\n"
+            text += f"├ <b>Лимитка: {best_wall_data['val']:.4f}</b>\n"
+            text += f"└ Осталось: <b>{best_wall_data['diff']:.2f}%</b>\n\n"
             
-            text += f"\n⚡️ <i>Выбирай цель по объему: если памп сильный — ставь выше (EMA 14/28).</i>"
+            text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
+            text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
+            text += f"⚡️ <i>Перегрев + Стена = Идеальный шорт!</i>"
 
             send_telegram_photo(chart_file, text)
             os.remove(chart_file)
