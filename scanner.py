@@ -17,8 +17,8 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-def get_htf_walls(sym, exchange, current_price):
-    """Ищем ВСЕ Недельные и Месячные EMA, которые находятся ВЫШЕ текущей цены"""
+def get_htf_ladder(sym, exchange, current_price):
+    """Ищем ВСЮ лестницу Недельных и Месячных EMA над ценой"""
     walls = []
     timeframes = {
         "MEXC": [("Week1", "1W"), ("Month1", "1M")], 
@@ -42,7 +42,7 @@ def get_htf_walls(sym, exchange, current_price):
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
                     
-                    # Берем ТОЛЬКО те EMA, которые ВЫШЕ текущей цены
+                    # Собираем ВСЕ EMA, которые выше текущей цены
                     if val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
                         walls.append({
@@ -53,28 +53,24 @@ def get_htf_walls(sym, exchange, current_price):
             time.sleep(0.1)
         except: pass
     
-    # Сортируем стены от ближайшей к самой дальней
+    # Сортируем от ближайшей к самой дальней
     walls.sort(key=lambda x: x['diff'])
     return walls
 
 def draw_chart(sym, df_15m, walls):
     try:
-        filename = f"{sym}_pump.png"
+        filename = f"{sym}_ladder.png"
         df = df_15m.copy()
         df.set_index('time', inplace=True)
         
-        # Рисуем линии для всех найденных стен
-        lines = [w['val'] for w in walls]
-        colors = ['red', 'orange', 'purple', 'blue'] # Разные цвета для разных EMA
-        widths = [2.0, 1.5, 1.5, 1.0]
+        # Рисуем горизонтальные линии для первых 3-х целей
+        lines = [w['val'] for w in walls[:3]]
+        colors = ['red', 'orange', 'purple'] 
+        hlines = dict(hlines=lines, colors=colors[:len(lines)], linestyle='-', linewidths=[2.0, 1.5, 1.5])
         
-        hlines = dict(hlines=lines, colors=colors[:len(lines)], linestyle='-', linewidths=widths[:len(lines)])
-        
-        mpf.plot(df.tail(40), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | SNIPER TARGETS (1W/1M)", tight_layout=True, hlines=hlines)
+        mpf.plot(df.tail(40), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | Sniper Ladder", tight_layout=True, hlines=hlines)
         return filename
-    except Exception as e: 
-        print(f"Chart error: {e}")
-        return None
+    except Exception as e: return None
 
 def get_15m_data(sym, exchange):
     try:
@@ -130,36 +126,32 @@ def main():
         df_15m = get_15m_data(sym, ex)
         if df_15m is None or len(df_15m) < 30: continue
         
-        # 🔥 ЛОВИМ ПАМП: Рост от 4% за 15 минут (параболическое движение)
+        # 1. Ловим памп (от 4% за 15 минут)
         open_p = df_15m['open'].iloc[-1]
         change_pct = ((current_price - open_p) / open_p) * 100
         
-        if change_pct < 4.0: continue # Если нет сильного пампа, пропускаем
+        if change_pct < 4.0: continue 
 
-        # Ищем Недельные и Месячные стены над ценой
-        walls = get_htf_walls(sym, ex, current_price)
-        if not walls: continue # Если цена выше всех EMA (космос), пропускаем
-
-        # Берем первую (самую близкую) и вторую стену
-        wall1 = walls[0]
-        wall2 = walls[1] if len(walls) > 1 else None
+        # 2. Ищем лестницу старших EMA
+        walls = get_htf_ladder(sym, ex, current_price)
+        if not walls: continue # Если цена уже выше всех EMA, пропускаем
 
         chart_file = draw_chart(sym, df_15m, walls)
         
         if chart_file:
             base_coin = sym.split('_')[0].replace('USDT', '')
             
-            text = f"🚀 <b>ПАМП +{change_pct:.2f}% (Ловим Пик!)</b>\n"
+            text = f"🚀 <b>ПАМП +{change_pct:.2f}% (Сетка целей)</b>\n"
             text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
             text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
             
-            text += f"🧱 <b>Твои цели на ШОРТ (1W/1M):</b>\n"
-            text += f"├ Ближайшая: <b>{wall1['name']}</b> на <code>{wall1['val']:.4f}</code> (+{wall1['diff']:.1f}%)\n"
-            if wall2:
-                text += f"└ Следующая: <b>{wall2['name']}</b> на <code>{wall2['val']:.4f}</code> (+{wall2['diff']:.1f}%)\n\n"
+            text += f"🎯 <b>Твоя лестница на ШОРТ:</b>\n"
             
-            text += f"🛑 <b>Стоп-лосс:</b> ставь на 2-3% выше выбранной EMA.\n"
-            text += f"⚡️ <i>Ставь лимитку ровно на уровень стены. Когда цена долетит и ударится — она рухнет.</i>"
+            # Выводим первые 3 цели (EMA 7, 14, 28)
+            for i, w in enumerate(walls[:3]):
+                text += f"├ <b>{w['name']}:</b> <code>{w['val']:.4f}</code> (+{w['diff']:.1f}%)\n"
+            
+            text += f"\n⚡️ <i>Выбирай цель по объему: если памп сильный — ставь выше (EMA 14/28).</i>"
 
             send_telegram_photo(chart_file, text)
             os.remove(chart_file)
