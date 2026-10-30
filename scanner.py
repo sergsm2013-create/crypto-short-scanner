@@ -2,6 +2,7 @@ import os
 import requests
 import pandas as pd
 import mplfinance as mpf
+import yfinance as yf
 import sys
 import time
 
@@ -17,6 +18,100 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
+def send_telegram_text(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try: requests.post(url, data={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=10)
+    except Exception as e: print(f"TG text error: {e}")
+
+# ==========================================
+# БЛОК ДЛЯ ЗОЛОТА (XAUUSD)
+# ==========================================
+def check_gold():
+    try:
+        # Загружаем данные по фьючерсу на золото (GC=F)
+        ticker = yf.Ticker("GC=F")
+        
+        # 1. Получаем 15-минутные данные за 2 дня
+        df_15m = ticker.history(period="2d", interval="15m")
+        if df_15m.empty or len(df_15m) < 5: return
+
+        # Проверяем импульс на последней свече (для золота 0.3% - это много)
+        current_open = df_15m['Open'].iloc[-1]
+        current_close = df_15m['Close'].iloc[-1]
+        change_pct = ((current_close - current_open) / current_open) * 100
+
+        direction = None
+        if change_pct >= 0.3: direction = 'SHORT'
+        elif change_pct <= -0.3: direction = 'LONG'
+        if not direction: return
+
+        # 2. Получаем данные старших ТФ для поиска стен
+        df_1h = ticker.history(period="1mo", interval="1h")
+        df_1d = ticker.history(period="1y", interval="1d")
+
+        walls = []
+        # Считаем EMA для 1H
+        for span in [50, 100, 200]:
+            if len(df_1h) >= span:
+                ema = df_1h['Close'].ewm(span=span, adjust=False).mean().iloc[-1]
+                if direction == 'SHORT' and ema > current_close:
+                    walls.append({'name': f'1H EMA {span}', 'val': ema, 'diff': ((ema - current_close) / current_close) * 100})
+                elif direction == 'LONG' and ema < current_close:
+                    walls.append({'name': f'1H EMA {span}', 'val': ema, 'diff': ((current_close - ema) / current_close) * 100})
+        
+        # Считаем EMA для 1D
+        for span in [7, 14, 28]:
+            if len(df_1d) >= span:
+                ema = df_1d['Close'].ewm(span=span, adjust=False).mean().iloc[-1]
+                if direction == 'SHORT' and ema > current_close:
+                    walls.append({'name': f'1D EMA {span}', 'val': ema, 'diff': ((ema - current_close) / current_close) * 100})
+                elif direction == 'LONG' and ema < current_close:
+                    walls.append({'name': f'1D EMA {span}', 'val': ema, 'diff': ((current_close - ema) / current_close) * 100})
+
+        if not walls: return # Если стены нет, пропускаем
+
+        # Ищем ближайшую стену
+        best_wall = min(walls, key=lambda x: x['diff'])
+        if best_wall['diff'] > 1.5: return # Для золота ищем стену не дальше 1.5%
+
+        # 3. Рисуем график
+        chart_file = "GOLD_chart.png"
+        df_plot = df_15m.copy()
+        df_plot.index = df_plot.index.tz_localize(None) # Убираем часовой пояс для mplfinance
+        hlines = dict(hlines=[best_wall['val']], colors=['red' if direction=='SHORT' else 'green'], linestyle='-', linewidths=2.0)
+        mpf.plot(df_plot.tail(30), type='candle', style='yahoo', volume=True, savefig=chart_file, title="XAUUSD 15m", tight_layout=True, hlines=hlines)
+
+        # 4. Формируем сообщение
+        if direction == 'SHORT':
+            stop_loss = best_wall['val'] * 1.002 # Стоп 0.2% выше стены
+            tp = best_wall['val'] * 0.995 # Тейк 0.5% ниже
+            emoji = "🔴"
+        else:
+            stop_loss = best_wall['val'] * 0.998
+            tp = best_wall['val'] * 1.005
+            emoji = "🟢"
+
+        text = f"{emoji} <b>[GOLD] СИГНАЛ: {direction}</b>\n"
+        text += f"🏦 <b>XAUUSD (Forex)</b>\n"
+        text += f"📊 Изм. 15м: <b>{change_pct:+.2f}%</b>\n"
+        text += f"💰 Цена: <code>{current_close:.2f}</code>\n\n"
+        text += f"🧱 <b>Стена:</b> {best_wall['name']}\n"
+        text += f"├ <b>Лимитка: {best_wall['val']:.2f}</b>\n"
+        text += f"└ Осталось: <b>{best_wall['diff']:.2f}%</b>\n\n"
+        text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.2f}</code>\n"
+        text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.2f}</code>\n\n"
+        text += f"⚡️ <i>Данные Yahoo Finance. Возможна задержка!</i>"
+
+        send_telegram_photo(chart_file, text)
+        if os.path.exists(chart_file): os.remove(chart_file)
+        print(f"[GOLD] Сигнал отправлен: {direction}")
+
+    except Exception as e:
+        print(f"Ошибка при анализе золота: {e}")
+
+# ==========================================
+# БЛОК ДЛЯ КРИПТЫ (MEXC / Bitget)
+# ==========================================
 def get_htf_emas(sym, exchange, current_price, direction):
     emas = {}
     timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D"), ("Week1", "1W"), ("Month1", "1M")], 
@@ -53,17 +148,6 @@ def calculate_rsi(df, period=14):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs)).iloc[-1]
-
-def draw_chart(sym, df_15m, target_val, target_name, direction):
-    try:
-        filename = f"{sym}_chart.png"
-        df = df_15m.copy()
-        df.set_index('time', inplace=True)
-        color = 'red' if direction == 'SHORT' else 'green'
-        hlines = dict(hlines=[target_val], colors=[color], linestyle='-', linewidths=2.0)
-        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | {direction} {target_name}", tight_layout=True, hlines=hlines)
-        return filename
-    except: return None
 
 def get_15m_data(sym, exchange):
     try:
@@ -105,6 +189,12 @@ def get_all_coins():
 def main():
     if not BOT_TOKEN or not CHAT_ID: sys.exit(1)
     
+    # 1. Сначала проверяем ЗОЛОТО
+    print("Проверка золота (XAUUSD)...")
+    check_gold()
+
+    # 2. Затем проверяем КРИПТУ
+    print("Проверка криптовалют...")
     start_time = time.time()
     all_coins = get_all_coins()
     unique_coins = {c['sym']: c for c in all_coins}.values()
@@ -112,7 +202,7 @@ def main():
     found = 0
     for coin in list(unique_coins):
         if found >= 3: break
-        if time.time() - start_time > 240: break
+        if time.time() - start_time > 180: break # Ограничиваем время крипты, чтобы уложиться в лимит GitHub
             
         sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
         
@@ -135,7 +225,12 @@ def main():
         
         best_wall_name, best_wall_data = min(wall.items(), key=lambda x: x[1]['diff'])
 
-        chart_file = draw_chart(sym, df_15m, best_wall_data['val'], best_wall_name, direction)
+        chart_file = f"{sym}_chart.png"
+        df = df_15m.copy()
+        df.set_index('time', inplace=True)
+        color = 'red' if direction == 'SHORT' else 'green'
+        hlines = dict(hlines=[best_wall_data['val']], colors=[color], linestyle='-', linewidths=2.0)
+        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=chart_file, title=f"{sym} 15m | {direction}", tight_layout=True, hlines=hlines)
         
         if chart_file:
             base_coin = sym.split('_')[0].replace('USDT', '')
@@ -151,7 +246,7 @@ def main():
                 emoji = "🟢"
                 action = "ЛОНГ"
 
-            text = f"{emoji} <b>СИГНАЛ: {action} (Старший ТФ)</b>\n"
+            text = f"{emoji} <b>[CRYPTO] СИГНАЛ: {action}</b>\n"
             text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
             text += f"📊 Изм. 15м: <b>{change_pct:+.2f}%</b> | RSI: <b>{rsi:.1f}</b>\n"
             text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
@@ -164,7 +259,7 @@ def main():
             text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
 
             send_telegram_photo(chart_file, text)
-            os.remove(chart_file)
+            if os.path.exists(chart_file): os.remove(chart_file)
             found += 1
             time.sleep(1)
 
