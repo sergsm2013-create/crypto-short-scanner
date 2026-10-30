@@ -1,5 +1,5 @@
 requests
-matplotlib
-mplfinance
 pandas
+mplfinance
 flask
+yfinance
