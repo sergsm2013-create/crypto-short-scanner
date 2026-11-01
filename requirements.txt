@@ -3,3 +3,4 @@ pandas
 mplfinance
 flask
 yfinance
+six
