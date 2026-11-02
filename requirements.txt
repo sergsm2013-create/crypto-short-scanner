@@ -4,3 +4,4 @@ mplfinance
 flask
 yfinance
 six
+numpy
