@@ -1,494 +1,174 @@
 import os
-import time
-import uuid
-import html
-import logging
 import requests
-import numpy as np
 import pandas as pd
-import yfinance as yf
 import mplfinance as mpf
+import sys
+import time
 
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
-# =========================================================
-# 1. CONFIGURATION
-# =========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SIGNALS_FILE = os.path.join(BASE_DIR, "signals.csv")
-LOG_FILE = os.path.join(BASE_DIR, "scanner.log")
-
-MIN_VOLUME_USDT = 5_000_000
-MAX_COINS = 80
-MAX_SCAN_SECONDS = 180
-
-MIN_RR = 2.0
-ATR_PERIOD = 14
-VOLUME_MULTIPLIER = 1.10
-
-MAX_SIGNAL_AGE = 96 # 24 часа для 15M свечей
-REQUEST_TIMEOUT = 10
-
-# Стратегии
-ENABLE_REVERSAL = True
-ENABLE_TREND = True
-
-# =========================================================
-# 2. LOGGING & HTTP
-# =========================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
-                    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()])
-log = logging.getLogger("TRADING_SCANNER")
-
-session = requests.Session()
-retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
-adapter = HTTPAdapter(max_retries=retry)
-session.mount("https://", adapter)
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-
-# =========================================================
-# 3. SIGNAL DATABASE
-# =========================================================
-COLUMNS = ["id", "market", "exchange", "symbol", "strategy", "direction", "entry_time",
-           "entry", "sl", "tp", "risk", "status", "exit_time", "exit_price", "result_r", "bars"]
-
-def load_signals():
-    if not os.path.exists(SIGNALS_FILE): return pd.DataFrame(columns=COLUMNS)
+def send_telegram_photo(photo_path, caption):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     try:
-        df = pd.read_csv(SIGNALS_FILE)
-        for col in COLUMNS:
-            if col not in df.columns: df[col] = np.nan
-        return df[COLUMNS]
-    except: return pd.DataFrame(columns=COLUMNS)
+        with open(photo_path, 'rb') as photo:
+            requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
+    except Exception as e: print(f"TG photo error: {e}")
 
-def save_signals(df):
-    temp = SIGNALS_FILE + ".tmp"
-    df.to_csv(temp, index=False)
-    os.replace(temp, SIGNALS_FILE)
+# --- ПОИСК EMA НА 4H, 1D, 1W, 1M ---
+def get_htf_emas(sym, exchange, current_price, direction):
+    emas = {}
+    timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D"), ("Week1", "1W"), ("Month1", "1M")], 
+                  "Bitget": [("4H", "4H"), ("1D", "1D"), ("1week", "1W"), ("1M", "1M")]}
+    for tf, tf_name in timeframes[exchange]:
+        try:
+            if exchange == 'MEXC':
+                res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={tf}", headers=HEADERS, timeout=5).json()
+                if res.get('success') and 'close' in res['data']: df = pd.DataFrame({'close': res['data']['close']})
+                else: continue
+            elif exchange == 'Bitget':
+                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=200", headers=HEADERS, timeout=5).json()
+                if res.get('code') == '00000' and res.get('data'):
+                    df = pd.DataFrame(res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                    df['close'] = df['close'].astype(float)
+                else: continue
 
-# =========================================================
-# 4. TELEGRAM
-# =========================================================
-def telegram_text(message):
-    if not BOT_TOKEN or not CHAT_ID: return False
-    try:
-        res = session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                           data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=REQUEST_TIMEOUT)
-        return res.json().get("ok", False)
-    except Exception as e:
-        log.error(f"TG text error: {e}")
-        return False
+            for span in [7, 14, 28, 50, 100, 200]:
+                if len(df) >= span:
+                    val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+                    if direction == 'SHORT' and val > current_price:
+                        diff_pct = ((val - current_price) / current_price) * 100
+                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
+                    elif direction == 'LONG' and val < current_price:
+                        diff_pct = ((current_price - val) / current_price) * 100
+                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
+            time.sleep(0.1)
+        except: pass
+    return emas
 
-def telegram_photo(path, caption):
-    if not BOT_TOKEN or not CHAT_ID: return False
-    try:
-        with open(path, "rb") as photo:
-            res = session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                               data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
-                               files={"photo": photo}, timeout=REQUEST_TIMEOUT)
-        return res.json().get("ok", False)
-    except Exception as e:
-        log.error(f"TG photo error: {e}")
-        return False
-
-# =========================================================
-# 5. INDICATORS & DATA NORMALIZATION
-# =========================================================
-def normalize_df(df):
-    if df is None or df.empty: return None
-    df = df.copy()
-    df.columns = [str(c).lower() for c in df.columns]
-    req = ["open", "high", "low", "close"]
-    if not all(c in df.columns for c in req): return None
-    for col in req: df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "volume" not in df.columns: df["volume"] = 0.0
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-    df = df.dropna(subset=req)
-    df = df[(df["high"] >= df["low"]) & (df["high"] >= df["open"]) & (df["low"] <= df["close"])]
-    return df.sort_index()
-
-def remove_open_candle(df):
-    if df is None or len(df) < 3: return None
-    return df.iloc[:-1].copy()
-
-def calculate_ema(series, period): return series.ewm(span=period, adjust=False).mean()
-
-def calculate_atr(df, period=14):
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-
+# --- РАСЧЕТ RSI ---
 def calculate_rsi(df, period=14):
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-9)
+    return 100 - (100 / (1 + rs)).iloc[-1]
 
-def prepare_indicators(df):
-    df = df.copy()
-    df["ema20"] = calculate_ema(df["close"], 20)
-    df["atr"] = calculate_atr(df, ATR_PERIOD)
-    df["rsi"] = calculate_rsi(df)
-    return df
-
-# =========================================================
-# 6. GLOBAL TREND FILTER (D1)
-# =========================================================
-def get_daily_bias(symbol):
+def draw_chart(sym, df_15m, target_val, target_name, direction):
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="1y", interval="1d")
-        if df.empty or len(df) < 200: return "NEUTRAL"
-        
-        ema200 = df['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
-        current = df['Close'].iloc[-1]
-        
-        if current > ema200: return "BULLISH"
-        if current < ema200: return "BEARISH"
-        return "NEUTRAL"
-    except: return "NEUTRAL"
+        filename = f"{sym}_chart.png"
+        df = df_15m.copy()
+        df.set_index('time', inplace=True)
+        color = 'red' if direction == 'SHORT' else 'green'
+        hlines = dict(hlines=[target_val], colors=[color], linestyle='-', linewidths=2.0)
+        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | {direction} {target_name}", tight_layout=True, hlines=hlines)
+        return filename
+    except: return None
 
-def get_market_bias_4h(df):
-    if df is None or len(df) < 105: return "NEUTRAL"
-    df = remove_open_candle(df)
-    if df is None or len(df) < 100: return "NEUTRAL"
-    close = df["close"]
-    ema50 = calculate_ema(close, 50).iloc[-1]
-    ema100 = calculate_ema(close, 100).iloc[-1]
-    price = close.iloc[-1]
-    if price > ema50 and ema50 > ema100: return "BULLISH"
-    if price < ema50 and ema50 < ema100: return "BEARISH"
-    return "NEUTRAL"
-
-# =========================================================
-# 7. RISK MANAGEMENT & STRATEGIES
-# =========================================================
-def volume_confirmed(df):
-    if len(df) < 25: return False
-    current = df["volume"].iloc[-1]
-    average = df["volume"].iloc[-21:-1].mean()
-    return current >= average * VOLUME_MULTIPLIER if average > 0 else True
-
-def calculate_trade_levels(direction, entry, structural_stop, atr):
-    if not np.isfinite(atr) or atr <= 0: return None
-    buffer = atr * 0.20
-    if direction == "LONG":
-        sl = structural_stop - buffer
-        risk = entry - sl
-        if risk <= 0 or risk > atr * 3: return None
-        tp = entry + risk * MIN_RR
-    else:
-        sl = structural_stop + buffer
-        risk = sl - entry
-        if risk <= 0 or risk > atr * 3: return None
-        tp = entry - risk * MIN_RR
-    return {"entry": float(entry), "sl": float(sl), "tp": float(tp), "risk": float(risk), "rr": MIN_RR}
-
-def find_reversal(df, bias_4h, bias_d1):
-    if len(df) < 110: return None # Нужно минимум 100 свечей для свипа
-    current = df.iloc[-1]
-    
-    # 🔥 СВИП ЗА 100 СВЕЧЕЙ (25 часов) 🔥
-    history = df.iloc[-101:-1]
-    structure = df.iloc[-7:-1] # Локальный слом структуры (последние 6 свечей)
-
-    atr = current["atr"]
-    rsi = current["rsi"]
-    if pd.isna(atr) or pd.isna(rsi) or atr <= 0: return None
-    if not volume_confirmed(df): return None
-
-    prev_high = history["high"].max()
-    prev_low = history["low"].min()
-    struct_high = structure["high"].max()
-    struct_low = structure["low"].min()
-
-    # SHORT
-    swept_high = current["high"] > prev_high and current["close"] < prev_high
-    bearish_choch = current["close"] < struct_low and current["close"] < current["open"]
-    
-    if swept_high and bearish_choch:
-        if bias_4h == "BULLISH" or bias_d1 == "BULLISH": return None # Запрет шорта в бычьем тренде
-        if rsi > 75: return None
-        
-        levels = calculate_trade_levels("SHORT", current["close"], current["high"], atr)
-        if levels: return {**levels, "direction": "SHORT", "strategy": "REVERSAL", "reason": "100-Candle Sweep + Bearish CHoCH"}
-
-    # LONG
-    swept_low = current["low"] < prev_low and current["close"] > prev_low
-    bullish_choch = current["close"] > struct_high and current["close"] > current["open"]
-
-    if swept_low and bullish_choch:
-        if bias_4h == "BEARISH" or bias_d1 == "BEARISH": return None # Запрет лонга в медвежьем тренде
-        if rsi < 25: return None
-        
-        levels = calculate_trade_levels("LONG", current["close"], current["low"], atr)
-        if levels: return {**levels, "direction": "LONG", "strategy": "REVERSAL", "reason": "100-Candle Sweep + Bullish CHoCH"}
+def get_15m_data(sym, exchange):
+    try:
+        if exchange == 'MEXC':
+            res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min15", headers=HEADERS, timeout=3).json()
+            if res.get('success'):
+                data = res['data']
+                return pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close'], 'volume': data['vol']})
+        elif exchange == 'Bitget':
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=3).json()
+            if res.get('code') == '00000':
+                data = res['data']
+                df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df = df.iloc[::-1]
+                df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms')
+                for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = df[col].astype(float)
+                return df
+    except: pass
     return None
-
-def find_trend_entry(df, bias):
-    if len(df) < 30: return None
-    current = df.iloc[-1]
-    history = df.iloc[-9:-1]
-    atr = current["atr"]
-    ema = current["ema20"]
-    rsi = current["rsi"]
-    
-    if pd.isna(atr) or pd.isna(ema) or pd.isna(rsi) or atr <= 0: return None
-    if not volume_confirmed(df): return None
-
-    if bias == "BULLISH":
-        pullback = current["low"] <= ema + atr * 0.25 and current["close"] > ema
-        impulse = current["close"] > history["high"].max() and current["close"] > current["open"]
-        if pullback and impulse and 50 <= rsi <= 75:
-            stop = history["low"].min()
-            levels = calculate_trade_levels("LONG", current["close"], stop, atr)
-            if levels: return {**levels, "direction": "LONG", "strategy": "TREND", "reason": "4H Bullish + EMA20 Pullback"}
-
-    if bias == "BEARISH":
-        pullback = current["high"] >= ema - atr * 0.25 and current["close"] < ema
-        impulse = current["close"] < history["low"].min() and current["close"] < current["open"]
-        if pullback and impulse and 25 <= rsi <= 50:
-            stop = history["high"].max()
-            levels = calculate_trade_levels("SHORT", current["close"], stop, atr)
-            if levels: return {**levels, "direction": "SHORT", "strategy": "TREND", "reason": "4H Bearish + EMA20 Pullback"}
-    return None
-
-# =========================================================
-# 8. DATA FETCHING
-# =========================================================
-def get_mexc_candles(symbol, interval="Min15"):
-    try:
-        url = f"https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval={interval}"
-        res = session.get(url, timeout=REQUEST_TIMEOUT).json()
-        if not res.get("success"): return None
-        data = res["data"]
-        df = pd.DataFrame({"time": pd.to_datetime(data["time"], unit="s", utc=True), "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data.get("vol", 0)})
-        df.set_index("time", inplace=True)
-        return normalize_df(df)
-    except: return None
-
-def get_bitget_candles(symbol, granularity="15m"):
-    try:
-        res = session.get("https://api.bitget.com/api/v2/mix/market/candles", params={"symbol": symbol, "productType": "USDT-FUTURES", "granularity": granularity, "limit": "200"}, timeout=REQUEST_TIMEOUT).json()
-        if res.get("code") != "00000": return None
-        df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume", "turnover"])
-        df["time"] = pd.to_datetime(pd.to_numeric(df["time"]), unit="ms", utc=True)
-        df.set_index("time", inplace=True)
-        return normalize_df(df)
-    except: return None
-
-def get_yahoo_data(symbol="GC=F", period="5d", interval="15m"):
-    try:
-        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-        if df.empty: return None
-        df.columns = [c.lower() for c in df.columns]
-        if df.index.tz is not None: df.index = df.index.tz_convert("UTC").tz_localize(None)
-        return normalize_df(df)
-    except: return None
-
-def get_yahoo_4h(symbol="GC=F"):
-    try:
-        df = yf.Ticker(symbol).history(period="730d", interval="1h", auto_adjust=False)
-        if df.empty: return None
-        df.columns = [c.lower() for c in df.columns]
-        if df.index.tz is not None: df.index = df.index.tz_convert("UTC").tz_localize(None)
-        df = normalize_df(df)
-        return df.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
-    except: return None
-
-# =========================================================
-# 9. MESSAGE & CHART
-# =========================================================
-def price_format(value):
-    if abs(value) >= 1000: return f"{value:.2f}"
-    if abs(value) >= 1: return f"{value:.4f}"
-    if abs(value) >= 0.01: return f"{value:.6f}"
-    return f"{value:.8f}"
-
-def format_signal(signal):
-    emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
-    risk = abs(signal["entry"] - signal["sl"])
-    reward = abs(signal["tp"] - signal["entry"])
-    return (
-        f"{emoji} <b>TRADING SCANNER 2.0</b>\n\n"
-        f"<b>{signal['direction']} | {signal['strategy']}</b>\n"
-        f"🏦 {signal['exchange']}\n🪙 <b>{signal['symbol']}</b>\n"
-        f"📊 ТФ: 15M | Тренд 4H: {signal['bias_4h']} | Тренд D1: {signal['bias_d1']}\n"
-        f"📉 RSI: {signal['rsi']:.1f}\n\n"
-        f"🔎 <b>Причина:</b> {signal['reason']}\n\n"
-        f"💰 Вход: <code>{price_format(signal['entry'])}</code>\n"
-        f"🛑 SL: <code>{price_format(signal['sl'])}</code>\n"
-        f"🎯 TP: <code>{price_format(signal['tp'])}</code>\n\n"
-        f"⚖️ Risk/Reward: <b>1:{reward/risk:.2f}</b>"
-    )
-
-def create_chart(df, signal):
-    filename = os.path.join(BASE_DIR, f"chart_{uuid.uuid4().hex[:8]}.png")
-    plot = df.tail(60).copy()
-    plot.index = pd.to_datetime(plot.index)
-    plot.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
-    
-    hlines = dict(hlines=[signal["entry"], signal["sl"], signal["tp"]], colors=["blue", "red", "green"], linestyle="--", linewidths=1.3)
-    mpf.plot(plot, type="candle", style="yahoo", volume=True, hlines=hlines, title=f"{signal['symbol']} | {signal['direction']} | 15M", tight_layout=True, savefig=dict(fname=filename, dpi=120))
-    return filename
-
-# =========================================================
-# 10. CORE LOGIC
-# =========================================================
-def analyze_market(df15, df4h, market, exchange, symbol):
-    if df15 is None or df4h is None: return None
-    df15, df4h = remove_open_candle(df15), remove_open_candle(df4h)
-    if df15 is None or df4h is None or len(df15) < 110 or len(df4h) < 100: return None
-
-    bias_4h = get_market_bias_4h(df4h)
-    bias_d1 = get_daily_bias(symbol if market == "GOLD" else symbol.replace("_", "").replace("USDT", "-USD"))
-    
-    df = prepare_indicators(df15)
-    candidates = []
-
-    if ENABLE_REVERSAL:
-        sig = find_reversal(df, bias_4h, bias_d1)
-        if sig: candidates.append(sig)
-    if ENABLE_TREND:
-        sig = find_trend_entry(df, bias_4h)
-        if sig: candidates.append(sig)
-
-    if len({x["direction"] for x in candidates}) > 1: return None
-    if not candidates: return None
-
-    signal = next((x for x in candidates if x["strategy"] == "REVERSAL"), candidates[0])
-    signal.update({
-        "market": market, "exchange": exchange, "symbol": symbol,
-        "bias_4h": bias_4h, "bias_d1": bias_d1, "entry_time": df.index[-1].isoformat(),
-        "rsi": float(df["rsi"].iloc[-1]), "atr": float(df["atr"].iloc[-1])
-    })
-    return signal
-
-def has_active_signal(db, market, exchange, symbol):
-    if db.empty: return False
-    return not db[(db["market"] == market) & (db["exchange"] == exchange) & (db["symbol"] == symbol) & (db["status"] == "OPEN")].empty
-
-def register_signal(signal, db):
-    record = {
-        "id": str(uuid.uuid4())[:8], "market": signal["market"], "exchange": signal["exchange"],
-        "symbol": signal["symbol"], "strategy": signal["strategy"], "direction": signal["direction"],
-        "entry_time": signal["entry_time"], "entry": signal["entry"], "sl": signal["sl"],
-        "tp": signal["tp"], "risk": signal["risk"], "status": "OPEN", "exit_time": "",
-        "exit_price": np.nan, "result_r": np.nan, "bars": 0
-    }
-    db = pd.concat([db, pd.DataFrame([record])], ignore_index=True)
-    save_signals(db)
-    return db
-
-def process_market(market, exchange, symbol, db, market_data):
-    key = (market, exchange, symbol)
-    
-    df15 = market_data.get(key) or get_mexc_candles(symbol, "Min15") if exchange == "MEXC" else market_data.get(key) or get_bitget_candles(symbol, "15m")
-    htf_key = ("HTF", exchange, symbol)
-    df4h = market_data.get(htf_key) or get_mexc_candles(symbol, "Hour4") if exchange == "MEXC" else market_data.get(htf_key) or get_bitget_candles(symbol, "4H")
-    
-    if df15 is not None: market_data[key] = df15
-    if df4h is not None: market_data[htf_key] = df4h
-
-    if df15 is None or df4h is None: return db
-    if has_active_signal(db, market, exchange, symbol): return db
-
-    signal = analyze_market(df15, df4h, market, exchange, symbol)
-    if not signal: return db
-
-    db = register_signal(signal, db)
-    msg = format_signal(signal)
-    
-    try:
-        chart = create_chart(prepare_indicators(remove_open_candle(df15)), signal)
-        if not telegram_photo(chart, msg): telegram_text(msg)
-        os.remove(chart)
-    except Exception as e:
-        log.error(f"Chart error: {e}")
-        telegram_text(msg)
-        
-    log.info(f"SIGNAL {exchange} {symbol} {signal['direction']} {signal['strategy']}")
-    return db
-
-def process_gold(db, market_data):
-    market, exchange, symbol = "GOLD", "Yahoo", "GC=F"
-    key, htf_key = (market, exchange, symbol), ("HTF", exchange, symbol)
-    
-    df15 = market_data.get(key) or get_yahoo_data("GC=F", "5d", "15m")
-    df4h = market_data.get(htf_key) or get_yahoo_4h("GC=F")
-    
-    if df15 is not None: market_data[key] = df15
-    if df4h is not None: market_data[htf_key] = df4h
-    if df15 is None or df4h is None: return db
-    if has_active_signal(db, market, exchange, symbol): return db
-
-    signal = analyze_market(df15, df4h, market, exchange, symbol)
-    if not signal: return db
-
-    db = register_signal(signal, db)
-    msg = format_signal(signal)
-    try:
-        chart = create_chart(prepare_indicators(remove_open_candle(df15)), signal)
-        if not telegram_photo(chart, msg): telegram_text(msg)
-        os.remove(chart)
-    except Exception as e:
-        telegram_text(msg)
-    return db
 
 def get_all_coins():
     coins = []
     try:
-        res = session.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=REQUEST_TIMEOUT).json()
-        if res.get("success"):
-            for item in res["data"]:
-                if item.get("symbol", "").endswith("_USDT") and float(item.get("amount24", 0)) >= MIN_VOLUME_USDT:
-                    coins.append({"market": "CRYPTO", "exchange": "MEXC", "symbol": item["symbol"], "volume": float(item.get("amount24", 0))})
+        res = requests.get("https://contract.mexc.com/api/v1/contract/ticker", headers=HEADERS, timeout=10).json()
+        if res.get('success'):
+            for c in res['data']:
+                if c['symbol'].endswith('_USDT') and float(c.get('amount24', 0)) > 5000000:
+                    coins.append({'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice'])})
     except: pass
-    
     try:
-        res = session.get("https://api.bitget.com/api/v2/mix/market/tickers", params={"productType": "USDT-FUTURES"}, timeout=REQUEST_TIMEOUT).json()
-        if res.get("code") == "00000":
-            for item in res["data"]:
-                if float(item.get("usdtVolume", 0)) >= MIN_VOLUME_USDT and item.get("symbol", "").endswith("USDT"):
-                    coins.append({"market": "CRYPTO", "exchange": "Bitget", "symbol": item["symbol"], "volume": float(item.get("usdtVolume", 0))})
+        res = requests.get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES", headers=HEADERS, timeout=10).json()
+        if res.get('code') == '00000':
+            for c in res['data']:
+                if float(c.get('usdtVolume', 0)) > 5000000:
+                    coins.append({'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr'])})
     except: pass
-    return sorted(coins, key=lambda x: x["volume"], reverse=True)[:MAX_COINS]
+    return coins
 
-# =========================================================
-# 11. MAIN
-# =========================================================
 def main():
-    if not BOT_TOKEN or not CHAT_ID: raise RuntimeError("Set BOT_TOKEN and CHAT_ID")
-    log.info("TRADING SCANNER 2.0 STARTED")
+    if not BOT_TOKEN or not CHAT_ID: sys.exit(1)
     
-    db = load_signals()
-    market_data = {}
-    
-    # 1. Золото
-    db = process_gold(db, market_data)
-    
-    # 2. Крипта
-    coins = get_all_coins()
     start_time = time.time()
+    all_coins = get_all_coins()
+    unique_coins = {c['sym']: c for c in all_coins}.values()
     
-    for number, coin in enumerate(coins, 1):
-        if time.time() - start_time > MAX_SCAN_SECONDS: break
-        try:
-            db = process_market(coin["market"], coin["exchange"], coin["symbol"], db, market_data)
-        except Exception as e:
-            log.error(f"{coin['symbol']}: {e}")
-        time.sleep(0.15)
+    found = 0
+    for coin in list(unique_coins):
+        if found >= 3: break
+        if time.time() - start_time > 240: break
+            
+        sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
         
-    save_signals(db)
-    log.info("SCAN COMPLETED")
+        df_15m = get_15m_data(sym, ex)
+        if df_15m is None or len(df_15m) < 30: continue
+        
+        open_p = df_15m['open'].iloc[-1]
+        change_pct = ((current_price - open_p) / open_p) * 100
+        
+        direction = None
+        if change_pct >= 2.0: direction = 'SHORT'
+        elif -3.0 <= change_pct <= -1.5: direction = 'LONG'
+        
+        if not direction: continue
+
+        rsi = calculate_rsi(df_15m)
+        
+        wall = get_htf_emas(sym, ex, current_price, direction)
+        if not wall: continue
+        
+        best_wall_name, best_wall_data = min(wall.items(), key=lambda x: x[1]['diff'])
+
+        chart_file = draw_chart(sym, df_15m, best_wall_data['val'], best_wall_name, direction)
+        
+        if chart_file:
+            base_coin = sym.split('_')[0].replace('USDT', '')
+            
+            if direction == 'SHORT':
+                stop_loss = best_wall_data['val'] * 1.015
+                tp = best_wall_data['val'] * 0.95
+                emoji = "🔴"
+                action = "ШОРТ"
+            else:
+                stop_loss = best_wall_data['val'] * 0.985
+                tp = best_wall_data['val'] * 1.05
+                emoji = "🟢"
+                action = "ЛОНГ"
+
+            text = f"{emoji} <b>СИГНАЛ: {action} (Старший ТФ)</b>\n"
+            text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
+            text += f"📊 Изм. 15м: <b>{change_pct:+.2f}%</b> | RSI: <b>{rsi:.1f}</b>\n"
+            text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
+            
+            text += f"🧱 <b>Стена:</b> {best_wall_name}\n"
+            text += f"├ <b>Лимитка: {best_wall_data['val']:.4f}</b>\n"
+            text += f"└ Осталось: <b>{best_wall_data['diff']:.2f}%</b>\n\n"
+            
+            text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
+            text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
+
+            send_telegram_photo(chart_file, text)
+            os.remove(chart_file)
+            found += 1
+            time.sleep(1)
 
 if __name__ == "__main__":
-    try: main()
-    except Exception as e: log.exception(f"FATAL ERROR: {e}")
+    main()
