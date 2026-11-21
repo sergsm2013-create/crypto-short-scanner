@@ -17,56 +17,12 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-# --- ПОИСК EMA НА 4H, 1D, 1W, 1M ---
-def get_htf_emas(sym, exchange, current_price, direction):
-    emas = {}
-    timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D"), ("Week1", "1W"), ("Month1", "1M")], 
-                  "Bitget": [("4H", "4H"), ("1D", "1D"), ("1week", "1W"), ("1M", "1M")]}
-    for tf, tf_name in timeframes[exchange]:
-        try:
-            if exchange == 'MEXC':
-                res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={tf}", headers=HEADERS, timeout=5).json()
-                if res.get('success') and 'close' in res['data']: df = pd.DataFrame({'close': res['data']['close']})
-                else: continue
-            elif exchange == 'Bitget':
-                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=200", headers=HEADERS, timeout=5).json()
-                if res.get('code') == '00000' and res.get('data'):
-                    df = pd.DataFrame(res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-                    df['close'] = df['close'].astype(float)
-                else: continue
+def send_telegram_text(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try: requests.post(url, data={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=10)
+    except Exception as e: print(f"TG text error: {e}")
 
-            for span in [7, 14, 28, 50, 100, 200]:
-                if len(df) >= span:
-                    val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
-                    if direction == 'SHORT' and val > current_price:
-                        diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
-                    elif direction == 'LONG' and val < current_price:
-                        diff_pct = ((current_price - val) / current_price) * 100
-                        if diff_pct <= 5.0: emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
-            time.sleep(0.1)
-        except: pass
-    return emas
-
-# --- РАСЧЕТ RSI ---
-def calculate_rsi(df, period=14):
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs)).iloc[-1]
-
-def draw_chart(sym, df_15m, target_val, target_name, direction):
-    try:
-        filename = f"{sym}_chart.png"
-        df = df_15m.copy()
-        df.set_index('time', inplace=True)
-        color = 'red' if direction == 'SHORT' else 'green'
-        hlines = dict(hlines=[target_val], colors=[color], linestyle='-', linewidths=2.0)
-        mpf.plot(df.tail(50), type='candle', style='yahoo', volume=True, savefig=filename, title=f"{sym} 15m | {direction} {target_name}", tight_layout=True, hlines=hlines)
-        return filename
-    except: return None
-
+# --- ФУНКЦИЯ СБОРА ДАННЫХ ---
 def get_15m_data(sym, exchange):
     try:
         if exchange == 'MEXC':
@@ -75,7 +31,7 @@ def get_15m_data(sym, exchange):
                 data = res['data']
                 return pd.DataFrame({'time': pd.to_datetime(data['time'], unit='s'), 'open': data['open'], 'high': data['high'], 'low': data['low'], 'close': data['close'], 'volume': data['vol']})
         elif exchange == 'Bitget':
-            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=50", headers=HEADERS, timeout=3).json()
+            res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity=15m&limit=200", headers=HEADERS, timeout=3).json()
             if res.get('code') == '00000':
                 data = res['data']
                 df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -86,6 +42,35 @@ def get_15m_data(sym, exchange):
     except: pass
     return None
 
+# --- ПОИСК EMA СТАРШИХ ТФ ---
+def get_htf_emas(sym, exchange, current_price):
+    emas = {}
+    timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D")], "Bitget": [("4H", "4H"), ("1D", "1D")]}
+    for tf, tf_name in timeframes[exchange]:
+        try:
+            if exchange == 'MEXC':
+                res = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={tf}", headers=HEADERS, timeout=3).json()
+                if res.get('success') and 'close' in res['data']: df = pd.DataFrame({'close': res['data']['close']})
+                else: continue
+            elif exchange == 'Bitget':
+                res = requests.get(f"https://api.bitget.com/api/v2/mix/market/candles?symbol={sym}&productType=USDT-FUTURES&granularity={tf}&limit=200", headers=HEADERS, timeout=3).json()
+                if res.get('code') == '00000' and res.get('data'):
+                    df = pd.DataFrame(res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                    df['close'] = df['close'].astype(float)
+                else: continue
+
+            for span in [7, 14, 28, 50, 100, 200]:
+                if len(df) >= span:
+                    val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+                    if val > current_price:
+                        diff_pct = ((val - current_price) / current_price) * 100
+                        if diff_pct <= 5.0: 
+                            emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
+            time.sleep(0.1)
+        except: pass
+    return emas
+
+# --- ГЛАВНЫЙ АНАЛИЗ ---
 def get_all_coins():
     coins = []
     try:
@@ -93,14 +78,14 @@ def get_all_coins():
         if res.get('success'):
             for c in res['data']:
                 if c['symbol'].endswith('_USDT') and float(c.get('amount24', 0)) > 5000000:
-                    coins.append({'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice'])})
+                    coins.append({'ex': 'MEXC', 'sym': c['symbol'], 'price': float(c['lastPrice']), 'change24h': float(c.get('riseFallRate', 0))*100})
     except: pass
     try:
         res = requests.get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES", headers=HEADERS, timeout=10).json()
         if res.get('code') == '00000':
             for c in res['data']:
                 if float(c.get('usdtVolume', 0)) > 5000000:
-                    coins.append({'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr'])})
+                    coins.append({'ex': 'Bitget', 'sym': c['symbol'], 'price': float(c['lastPr']), 'change24h': float(c.get('change24h', 0))*100})
     except: pass
     return coins
 
@@ -116,59 +101,75 @@ def main():
         if found >= 3: break
         if time.time() - start_time > 240: break
             
-        sym, ex, current_price = coin['sym'], coin['ex'], coin['price']
+        sym, ex, current_price, change24h = coin['sym'], coin['ex'], coin['price'], coin['change24h']
         
-        df_15m = get_15m_data(sym, ex)
-        if df_15m is None or len(df_15m) < 30: continue
+        df = get_15m_data(sym, ex)
+        if df is None or len(df) < 100: continue
         
-        open_p = df_15m['open'].iloc[-1]
+        # 1. Фильтр 24-часового роста. Если выросло больше 25% - НЕ ШОРТИМ!
+        if change24h > 25.0:
+            print(f"Пропуск {sym}: сильный рост за 24ч ({change24h:.1f}%)")
+            continue
+
+        # 2. Ловим памп на 15-минутке (от 2%)
+        open_p = df['open'].iloc[-1]
         change_pct = ((current_price - open_p) / open_p) * 100
-        
-        direction = None
-        if change_pct >= 2.0: direction = 'SHORT'
-        elif -3.0 <= change_pct <= -1.5: direction = 'LONG'
-        
-        if not direction: continue
+        if change_pct < 2.0: continue
 
-        rsi = calculate_rsi(df_15m)
+        # 3. Ищем исторический максимум за последние 200 свечей (50 часов)
+        recent_high = df['high'].iloc[-200:].max()
         
-        wall = get_htf_emas(sym, ex, current_price, direction)
-        if not wall: continue
+        # Если текущая цена УЖЕ выше исторического максимума, мы не шортим (пробой)
+        if current_price >= recent_high * 0.995:
+            continue
+
+        # 4. Ищем EMA
+        emas = get_htf_emas(sym, ex, current_price)
+        if not emas: continue
         
-        best_wall_name, best_wall_data = min(wall.items(), key=lambda x: x[1]['diff'])
-
-        chart_file = draw_chart(sym, df_15m, best_wall_data['val'], best_wall_name, direction)
+        best_ema_name, best_ema_data = min(emas.items(), key=lambda x: x[1]['diff'])
         
-        if chart_file:
-            base_coin = sym.split('_')[0].replace('USDT', '')
-            
-            if direction == 'SHORT':
-                stop_loss = best_wall_data['val'] * 1.015
-                tp = best_wall_data['val'] * 0.95
-                emoji = "🔴"
-                action = "ШОРТ"
-            else:
-                stop_loss = best_wall_data['val'] * 0.985
-                tp = best_wall_data['val'] * 1.05
-                emoji = "🟢"
-                action = "ЛОНГ"
+        # 5. Выбираем цель: Исторический хай или EMA (что ближе)
+        if abs(current_price - recent_high) / current_price < 0.05: # Хай близко (до 5%)
+            target_name = "Исторический хай (200 свечей)"
+            target_val = recent_high
+        else:
+            target_name = best_ema_name
+            target_val = best_ema_data['val']
 
-            text = f"{emoji} <b>СИГНАЛ: {action} (Старший ТФ)</b>\n"
-            text += f"🏦 <b>{ex}</b> | 🪙 <b>{base_coin}</b>\n"
-            text += f"📊 Изм. 15м: <b>{change_pct:+.2f}%</b> | RSI: <b>{rsi:.1f}</b>\n"
-            text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
-            
-            text += f"🧱 <b>Стена:</b> {best_wall_name}\n"
-            text += f"├ <b>Лимитка: {best_wall_data['val']:.4f}</b>\n"
-            text += f"└ Осталось: <b>{best_wall_data['diff']:.2f}%</b>\n\n"
-            
-            text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
-            text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
+        # 6. Лимитка ставится на 0.2% ВЫШЕ цели (для гарантированного срабатывания)
+        entry_price = target_val * 1.002
+        
+        # 7. Расчет стопа и тейка
+        stop_loss = entry_price * 1.02 # Стоп 2% выше входа
+        tp = entry_price * 0.95 # Тейк 5% ниже
 
-            send_telegram_photo(chart_file, text)
-            os.remove(chart_file)
-            found += 1
-            time.sleep(1)
+        # --- РИСОВАНИЕ ---
+        chart_file = f"{sym}_chart.png"
+        df_plot = df.copy()
+        df_plot.set_index('time', inplace=True)
+        hlines = dict(hlines=[entry_price, target_val], colors=['blue', 'red'], linestyle='--', linewidths=1.5)
+        mpf.plot(df_plot.tail(60), type='candle', style='yahoo', volume=True, savefig=chart_file, title=f"{sym} 15m | Target: {target_name}", tight_layout=True, hlines=hlines)
+
+        # --- ТЕКСТ ---
+        text = f"🔴 <b>СИГНАЛ: ШОРТ (Умный вход)</b>\n"
+        text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym.split('_')[0]}</b>\n"
+        text += f"📊 Рост 15м: <b>{change_pct:+.2f}%</b>\n"
+        text += f"🌍 Рост за 24ч: <b>{change24h:+.1f}%</b>\n"
+        text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
+        
+        text += f"🧱 <b>Цель (Сопротивление):</b> {target_name}\n"
+        text += f"├ <b>Лимитка: {entry_price:.4f}</b>\n"
+        text += f"└ Осталось: <b>{((entry_price-current_price)/current_price)*100:.2f}%</b>\n\n"
+        
+        text += f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
+        text += f"🟢 <b>Тейк-профит:</b> <code>{tp:.4f}</code>\n\n"
+        text += f"⚡️ <i>Если цена пробьет {target_name} и закрепится выше — ОТМЕНИ лимитку.</i>"
+
+        send_telegram_photo(chart_file, text)
+        os.remove(chart_file)
+        found += 1
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
