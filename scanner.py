@@ -10,8 +10,8 @@ CHAT_ID = os.environ.get("CHAT_ID")
 
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-MIN_VOLUME_USDT = 5_000_000
-MIN_24H_CHANGE = 10.0  # Снизили до 10%, чтобы ловить больше монет в начале
+MIN_VOLUME_USDT = 3_000_000  # Снизили объем, чтобы ловить больше альткоинов
+MIN_24H_CHANGE = 10.0        # Монета должна быть в игре (рост от 10% за сутки)
 MAX_SIGNALS_PER_RUN = 5
 
 def send_telegram_photo(photo_path, caption):
@@ -21,9 +21,12 @@ def send_telegram_photo(photo_path, caption):
             requests.post(url, files={'photo': photo}, data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, headers=HEADERS, timeout=15)
     except Exception as e: print(f"TG photo error: {e}")
 
-def get_htf_emas(sym, exchange, current_price):
+# --- ФУНКЦИЯ ПОИСКА EMA НА 1H И 15M ---
+def get_intraday_emas(sym, exchange, current_price):
     emas = {}
-    timeframes = {"MEXC": [("Hour4", "4H"), ("Day1", "1D")], "Bitget": [("4H", "4H"), ("1D", "1D")]}
+    # Теперь смотрим на 1H и 15M
+    timeframes = {"MEXC": [("Min60", "1H"), ("Min15", "15m")], "Bitget": [("1H", "1H"), ("15m", "15m")]}
+    
     for tf, tf_name in timeframes[exchange]:
         try:
             if exchange == 'MEXC':
@@ -37,12 +40,14 @@ def get_htf_emas(sym, exchange, current_price):
                     df['close'] = df['close'].astype(float)
                 else: continue
 
-            for span in [7, 14, 28, 50, 100, 200]:
+            # Ищем EMA 7, 14, 28, 50
+            for span in [7, 14, 28, 50]:
                 if len(df) >= span:
                     val = df['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+                    # Нам нужны только EMA, которые ВЫШЕ текущей цены (куда лететь для шорта)
                     if val > current_price:
                         diff_pct = ((val - current_price) / current_price) * 100
-                        if diff_pct <= 10.0: 
+                        if diff_pct <= 3.0: # Ищем только близкие цели (до 3%)
                             emas[f"{tf_name} EMA {span}"] = {'val': val, 'diff': diff_pct}
             time.sleep(0.1)
         except: pass
@@ -104,7 +109,7 @@ def main():
         df = get_15m_data(sym, ex)
         if df is None or len(df) < 30: continue
         
-        # 🔥 ЛОВИМ МОМЕНТ 🔥
+        # 🔥 ЛОВИМ МОМЕНТ (Импульс прямо сейчас) 🔥
         open_p = df['open'].iloc[-1]
         current_pump = ((current_price - open_p) / open_p) * 100
         
@@ -112,31 +117,34 @@ def main():
         avg_vol = df['volume'].iloc[-20:-1].mean()
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
         
-        # Сигнал только если прямо сейчас идет импульс (рост от 1.5% или объем x3)
-        is_impulse = current_pump >= 1.5 or vol_ratio >= 3.0
-        if not is_impulse: continue # Если свеча вялая, пропускаем
+        # Если нет импульса (свеча вялая и объем низкий) - пропускаем
+        if current_pump < 1.0 and vol_ratio < 2.0: continue
 
-        emas = get_htf_emas(sym, ex, current_price)
+        # Ищем ближайшие EMA на 1H и 15m
+        emas = get_intraday_emas(sym, ex, current_price)
+        
         ema_text = ""
         if emas:
             sorted_emas = sorted(emas.items(), key=lambda x: x[1]['diff'])
-            for name, data in sorted_emas[:3]:
+            for name, data in sorted_emas[:3]: # Берем 3 ближайшие цели
                 ema_text += f"├ <b>{name}:</b> <code>{data['val']:.4f}</code> (+{data['diff']:.1f}%)\n"
+            ema_text += "\n<i>👆 Ставь лимитку на первую EMA. Если пробьет — на вторую.</i>"
         else:
-            ema_text = "⚠️ <i>Ближайших EMA нет.</i>"
+            ema_text = "⚠️ <i>Ближайших EMA (1H/15m) над ценой нет. Цена в космосе.</i>"
 
-        chart_file = f"{sym}_anomaly.png"
+        # Рисуем график
+        chart_file = f"{sym}_scalp.png"
         df_plot = df.copy()
         df_plot.set_index('time', inplace=True)
-        mpf.plot(df_plot.tail(40), type='candle', style='yahoo', volume=True, savefig=chart_file, title=f"{sym} 15m | PUMP STARTING +{change24h:.1f}%", tight_layout=True)
+        mpf.plot(df_plot.tail(40), type='candle', style='yahoo', volume=True, savefig=chart_file, title=f"{sym} 15m | SCALP +{change24h:.1f}%", tight_layout=True)
 
-        text = f"🚨 <b>НАЧАЛО ИМПУЛЬСА!</b>\n"
+        # Текст сообщения
+        text = f"⚡️ <b>СКАЛЬП-СИГНАЛ: ИМПУЛЬС!</b>\n"
         text += f"🏦 <b>{ex}</b> | 🪙 <b>{sym.split('_')[0]}</b>\n\n"
         text += f"🔥 <b>Рост 24ч: {change24h:+.1f}%</b>\n"
-        text += f"⚡️ <b>Импульс 15м: {current_pump:+.2f}% (Vol x{vol_ratio:.1f})</b>\n"
+        text += f"📊 <b>Импульс 15м: {current_pump:+.2f}% (Vol x{vol_ratio:.1f})</b>\n"
         text += f"💰 Цена: <code>{current_price:.4f}</code>\n\n"
-        text += f"🧱 <b>Цели:</b>\n{ema_text}\n"
-        text += f"<i>👆 Смотри на EMA. Если цена в них упрется — ШОРТ!</i>"
+        text += f"🎯 <b>Ближайшие цели (1H / 15m):</b>\n{ema_text}"
 
         send_telegram_photo(chart_file, text)
         os.remove(chart_file)
